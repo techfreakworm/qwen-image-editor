@@ -35,3 +35,6 @@ flagged/
 .idea/
 .vscode/
 *.swp
+
+# CI workflow retained locally; pushing it needs a PAT with the "workflow" scope
+.github/workflows/
