@@ -1,0 +1,31 @@
+# Core
+gradio==5.50.0
+
+# `spaces` is NOT pinned here: HF Spaces injects the correct version automatically at
+# ZeroGPU build time. Pinning it would cause a pip resolution conflict with the injected
+# package and break the Space build.
+
+# diffusers is pinned to the exact commit used by the official Qwen/Qwen-Image-Edit-2511
+# Space (https://huggingface.co/spaces/Qwen/Qwen-Image-Edit-2511). This ensures
+# QwenImageEditPlusPipeline and FlowMatchEulerDiscreteScheduler APIs are stable and
+# match the Lightning LoRA scheduler config that was tested against that commit.
+diffusers @ git+https://github.com/huggingface/diffusers.git@973a077c6a4e7e7a7ea61a84bedd29ac24fb609a
+
+transformers
+accelerate
+safetensors
+sentencepiece
+
+# peft provides adapter enable/disable for the Lightning LoRA speed toggle
+# (Fast mode: adapter enabled; Quality mode: adapter disabled — no fuse/unfuse churn)
+peft
+
+torch>=2.5
+torchvision
+pillow>=10.4
+numpy>=1.26
+
+# Dev
+ruff>=0.6
+pytest>=8
+pytest-mock
