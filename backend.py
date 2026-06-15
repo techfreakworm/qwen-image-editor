@@ -21,16 +21,14 @@ def _identity(fn):
 
 
 def duration_for(mode: str, params: dict[str, Any]) -> int:
-    """Estimate the ZeroGPU slot duration (seconds) for a request; clamped to [60, 180].
+    """ZeroGPU slot budget in seconds (returns the 180 s ceiling).
 
-    The dominant cost on a ~58 GB model is the ZeroGPU GPU-attach + tensor unpack
-    to the assigned GPU, NOT the step count — so both presets need a generous
-    budget (the official Qwen-Image-Edit-2511 Space reserves 180 s). Fast gets a
-    smaller-but-ample budget; Quality reserves the full window.
+    Measured on this Space: the per-call cost is dominated by the ~58 GB model's
+    GPU materialization (~130 s); each denoising step is only ~1.4 s. So both
+    presets need the full window the official Qwen-Image-Edit-2511 Space relies on.
+    Quality's step count is kept low enough (see app._speed_defaults) to finish
+    within this budget.
     """
-    p = params if isinstance(params, dict) else {}
-    if p.get("speed") == "Fast":
-        return 120
     return 180
 
 

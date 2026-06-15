@@ -14,7 +14,7 @@ def test_speed_defaults_fast_steps_and_cfg():
 
 def test_speed_defaults_quality_steps_and_cfg():
     result = app._speed_defaults("Quality")
-    assert result[:2] == (40, 4.0)
+    assert result[:2] == (28, 4.0)
 
 
 def test_speed_defaults_fast_quality_grp_hidden():

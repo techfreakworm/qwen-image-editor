@@ -39,7 +39,7 @@ def _speed_defaults(speed: str) -> tuple:
     """
     if speed == "Fast":
         return (4, 1.0, gr.update(visible=False))
-    return (40, 4.0, gr.update(visible=True))
+    return (28, 4.0, gr.update(visible=True))
 
 
 # ----- Generation event handlers ---------------------------------------------

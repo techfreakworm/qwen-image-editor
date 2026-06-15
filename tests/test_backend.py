@@ -26,14 +26,14 @@ def fake_backend(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_duration_for_fast_returns_120():
-    # Fast reserves a generous-but-smaller budget to cover the ZeroGPU unpack + 4-step run.
-    assert backend.duration_for("edit", {"speed": "Fast"}) == 120
+def test_duration_for_fast_returns_180():
+    # The 58 GB per-call GPU unpack dominates, so every call reserves the full window.
+    assert backend.duration_for("edit", {"speed": "Fast"}) == 180
 
 
 def test_duration_for_fast_ignores_steps():
     """Fast is a fixed budget regardless of steps."""
-    assert backend.duration_for("compose", {"speed": "Fast", "steps": 100}) == 120
+    assert backend.duration_for("compose", {"speed": "Fast", "steps": 100}) == 180
 
 
 def test_duration_for_quality_default_steps():
@@ -60,10 +60,11 @@ def test_duration_for_clamps_to_maximum():
     assert result == 180
 
 
-def test_duration_for_quality_gt_fast():
+def test_duration_for_quality_ge_fast():
+    # Both presets reserve the full 180 s window (the per-call unpack dominates).
     quality = backend.duration_for("edit", {"speed": "Quality", "steps": 40})
     fast = backend.duration_for("edit", {"speed": "Fast"})
-    assert quality > fast
+    assert quality >= fast == 180
 
 
 def test_duration_for_returns_int():
