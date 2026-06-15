@@ -183,4 +183,6 @@ if models.on_spaces():
 
 
 if __name__ == "__main__":
-    build_app().queue().launch()
+    # default_concurrency_limit=1 → one ZeroGPU task at a time (a 58 GB model can't
+    # share a slot; uncapped queueing also spawns multiple GPU workers).
+    build_app().queue(default_concurrency_limit=1).launch()

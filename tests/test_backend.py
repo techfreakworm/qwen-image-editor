@@ -26,32 +26,32 @@ def fake_backend(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_duration_for_fast_returns_60():
-    assert backend.duration_for("edit", {"speed": "Fast"}) == 60
+def test_duration_for_fast_returns_120():
+    # Fast reserves a generous-but-smaller budget to cover the ZeroGPU unpack + 4-step run.
+    assert backend.duration_for("edit", {"speed": "Fast"}) == 120
 
 
 def test_duration_for_fast_ignores_steps():
-    """Fast always returns 60 regardless of steps."""
-    assert backend.duration_for("compose", {"speed": "Fast", "steps": 100}) == 60
+    """Fast is a fixed budget regardless of steps."""
+    assert backend.duration_for("compose", {"speed": "Fast", "steps": 100}) == 120
 
 
 def test_duration_for_quality_default_steps():
-    # steps defaults to 40: 30 + 40 * 3.5 = 170, in range [60, 180]
+    # Quality reserves the full window (matches the official Space's 180 s).
     result = backend.duration_for("edit", {"speed": "Quality"})
-    assert result == 170
+    assert result == 180
     assert 60 <= result <= 180
 
 
 def test_duration_for_quality_40_steps_explicit():
     result = backend.duration_for("edit", {"speed": "Quality", "steps": 40})
-    assert result == 170
+    assert result == 180
     assert 60 <= result <= 180
 
 
-def test_duration_for_clamps_to_minimum():
-    # steps=0: 30 + 0 * 3.5 = 30, clamped up to 60
-    result = backend.duration_for("edit", {"speed": "Quality", "steps": 0})
-    assert result == 60
+def test_duration_for_quality_ignores_low_steps():
+    # Quality is a fixed 180 s budget regardless of the step count.
+    assert backend.duration_for("edit", {"speed": "Quality", "steps": 0}) == 180
 
 
 def test_duration_for_clamps_to_maximum():

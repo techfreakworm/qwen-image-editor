@@ -21,19 +21,30 @@ def _identity(fn):
 
 
 def duration_for(mode: str, params: dict[str, Any]) -> int:
-    """Estimate ZeroGPU duration for a request. Pure function; clamped to [60, 180].
+    """Estimate the ZeroGPU slot duration (seconds) for a request; clamped to [60, 180].
 
-    Fast mode always returns 60 (Lightning LoRA runs in ~10-15 s on H200).
-    Quality mode scales linearly with the number of inference steps,
-    clamped to the [60, 180] second range.
+    The dominant cost on a ~58 GB model is the ZeroGPU GPU-attach + tensor unpack
+    to the assigned GPU, NOT the step count — so both presets need a generous
+    budget (the official Qwen-Image-Edit-2511 Space reserves 180 s). Fast gets a
+    smaller-but-ample budget; Quality reserves the full window.
     """
-    if params.get("speed") == "Fast":
-        return 60
-    steps = int(params.get("steps", 40))
-    return int(min(180, max(60, 30 + steps * 3.5)))
+    p = params if isinstance(params, dict) else {}
+    if p.get("speed") == "Fast":
+        return 120
+    return 180
 
 
-_GPU = spaces.GPU(duration=lambda *a, **kw: duration_for(*a[1:3])) if (spaces is not None and _ON_SPACES) else _identity
+def _duration_arg(*args: Any, **kwargs: Any) -> int:
+    """Locate the params dict among the decorated method's call args.
+
+    spaces passes generate()'s args (which include ``self``) to this callable, so
+    we scan for the params dict rather than relying on a fixed positional index.
+    """
+    params = next((a for a in args if isinstance(a, dict)), {})
+    return duration_for("", params)
+
+
+_GPU = spaces.GPU(duration=_duration_arg) if (spaces is not None and _ON_SPACES) else _identity
 
 
 def _build_pipeline() -> Any:

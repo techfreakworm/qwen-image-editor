@@ -38,3 +38,6 @@ flagged/
 
 # CI workflow retained locally; pushing it needs a PAT with the "workflow" scope
 .github/workflows/
+
+# Playwright MCP artifacts + local test assets
+.playwright-mcp/
