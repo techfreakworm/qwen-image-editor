@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+
+# Brainstorm + scratch
+.superpowers/
+
+# Reference clones (local research only — never commit)
+.refs/
+
+# Model weights (never commit)
+*.safetensors
+*.gguf
+*.bin
+*.pt
+*.pth
+
+# HF / model cache + diffusers-local layout
+models/
+
+# Gradio runtime
+gradio_cached_examples/
+output/
+flagged/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
