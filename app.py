@@ -11,7 +11,7 @@ os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 import gradio as gr
 
 import backend
-import models  # noqa: F401 — imported for public API availability
+import models
 import theme
 import tooltips  # noqa: F401 — imported for public API availability
 import ui
@@ -171,6 +171,15 @@ def build_app() -> gr.Blocks:
                 )
 
     return demo
+
+
+# ----- HF ZeroGPU eager startup ----------------------------------------------
+# On Spaces, build the pipeline at import (startup) so the `spaces` runtime
+# registers the QwenImageEditPlusPipeline's CUDA allocations during the
+# supported startup phase — mirroring the official Qwen-Image-Edit-2511 diffusers
+# Space. Locally / in CI (not on Spaces) we stay lazy so `import app` needs no torch.
+if models.on_spaces():
+    _get_backend()
 
 
 if __name__ == "__main__":

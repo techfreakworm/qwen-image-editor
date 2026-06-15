@@ -10,12 +10,7 @@ python_version: "3.11"
 suggested_hardware: zero-a10g
 hf_oauth: false
 preload_from_hub:
-  - Qwen/Qwen-Image-Edit-2511 transformer/**
-  - Qwen/Qwen-Image-Edit-2511 vae/**
-  - Qwen/Qwen-Image-Edit-2511 text_encoder/**
-  - Qwen/Qwen-Image-Edit-2511 tokenizer/**
-  - Qwen/Qwen-Image-Edit-2511 scheduler/**
-  - Qwen/Qwen-Image-Edit-2511 processor/**
+  - Qwen/Qwen-Image-Edit-2511 transformer/*,vae/*,text_encoder/*,tokenizer/*,scheduler/*,processor/*,model_index.json
   - lightx2v/Qwen-Image-Edit-2511-Lightning Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors
 ---
 
