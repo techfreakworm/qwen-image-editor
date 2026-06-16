@@ -23,14 +23,14 @@ peft
 torch>=2.5
 torchvision
 
-# torchao provides the fp8 weight-only quantization used in backend._build_pipeline
-# (Float8WeightOnlyConfig) to shrink the transformer ~40GB->~20GB so the ZeroGPU
+# optimum-quanto provides the fp8 (qfloat8) weight-only quantization used in
+# backend._build_pipeline to shrink the transformer ~40GB->~20GB so the ZeroGPU
 # per-call materialization fits the proxy-token TTL.
-# PINNED to 0.12.0: the pinned diffusers commit (973a077, Dec 2025) imports
-# `torchao.dtypes.floatx.float8_layout.Float8AQTTensorImpl`, which newer torchao
-# removed/moved — an unpinned (latest) torchao crashes the diffusers import at
-# startup. 0.12.0 still has that module path.
-torchao==0.12.0
+# We use quanto (NOT torchao) on purpose: diffusers@973a077 eagerly imports its
+# torchao quantizer at pipeline-import time, and no torchao version is compatible
+# with BOTH that pinned diffusers AND the Space's (newer) torch. quanto quantizes
+# the model directly and does not trip diffusers' quantizer imports.
+optimum-quanto
 pillow>=10.4
 numpy>=1.26
 

@@ -72,27 +72,30 @@ def _build_pipeline() -> Any:
         FlowMatchEulerDiscreteScheduler,
         QwenImageEditPlusPipeline,
         QwenImageTransformer2DModel,
-        TorchAoConfig,
     )
-    from torchao.quantization import Float8WeightOnlyConfig
+    from optimum.quanto import freeze, qfloat8, quantize
 
     import models
 
     device = models.auto_device()
 
-    # fp8 weight-only quantize the transformer at load: ~40 GB bf16 -> ~20 GB fp8.
-    # The matmul stays in bfloat16, so bf16 LoRAs still apply via dynamic
-    # set_adapters (we never fuse). Text encoder + VAE stay bf16 -> ~34 GB
-    # resident, which fits ZeroGPU's `large` (48 GB) tier and ~halves the per-call
-    # GPU materialization, so the call completes inside ZeroGPU's proxy-token TTL.
-    # (The bf16 58 GB model took ~140 s/call -> exceeded the TTL -> the image was
-    # produced server-side but never delivered to the UI/API.)
+    # fp8 weight-only quantize the transformer (~40 GB bf16 -> ~20 GB fp8) with
+    # optimum-quanto. Weights are stored fp8 but the matmul stays bf16, so bf16
+    # LoRAs still apply via dynamic set_adapters (we never fuse). Text encoder +
+    # VAE stay bf16 -> ~34 GB resident, which fits ZeroGPU's `large` (48 GB) tier
+    # and ~halves the per-call GPU materialization, so the call completes inside
+    # ZeroGPU's proxy-token TTL. (The bf16 58 GB model took ~140 s/call ->
+    # exceeded the TTL -> the image was produced server-side but never delivered.)
+    # quanto (not torchao) is used because diffusers@973a077 eagerly imports its
+    # torchao quantizer, and no torchao version is compatible with both that
+    # pinned diffusers and the Space's torch.
     transformer = QwenImageTransformer2DModel.from_pretrained(
         models.MODEL_ID,
         subfolder="transformer",
-        quantization_config=TorchAoConfig(Float8WeightOnlyConfig()),
         torch_dtype=torch.bfloat16,
     )
+    quantize(transformer, weights=qfloat8)
+    freeze(transformer)
 
     pipe = QwenImageEditPlusPipeline.from_pretrained(
         models.MODEL_ID,
