@@ -26,45 +26,47 @@ def fake_backend(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_duration_for_fast_returns_180():
-    # The 58 GB per-call GPU unpack dominates, so every call reserves the full window.
-    assert backend.duration_for("edit", {"speed": "Fast"}) == 180
+# The Space runs on the xlarge ZeroGPU tier (58 GB model), which DOUBLES the
+# requested duration for ZeroGPU's per-call ceiling check. Requests at/above the
+# ceiling are rejected ("ZeroGPU illegal duration"). These tests lock in the two
+# invariants that keep the GPU path working, rather than a magic number.
+_XLARGE_MULTIPLIER = 2
+_ZEROGPU_CEILING = 300  # requested-seconds; reaching this is rejected on this Space
+
+_DURATION_CASES = (
+    {"speed": "Fast"},
+    {"speed": "Fast", "steps": 100},
+    {"speed": "Quality"},
+    {"speed": "Quality", "steps": 40},
+    {"speed": "Quality", "steps": 1000},
+)
+
+
+def test_duration_for_legal_on_xlarge():
+    """The doubled request must stay under ZeroGPU's per-call ceiling.
+
+    This is the regression guard against the illegal-duration bug: a 180 s
+    request became 360 s on xlarge and every call was rejected.
+    """
+    for params in _DURATION_CASES:
+        d = backend.duration_for("edit", params)
+        assert d * _XLARGE_MULTIPLIER < _ZEROGPU_CEILING, (
+            f"duration {d}s -> {d * _XLARGE_MULTIPLIER}s requested >= {_ZEROGPU_CEILING}s ceiling (illegal on xlarge)"
+        )
+
+
+def test_duration_for_covers_materialization():
+    """Budget must be high enough to cover most of the ~130 s per-call model
+    materialization, else the GPU task aborts mid-load."""
+    for params in _DURATION_CASES:
+        assert backend.duration_for("edit", params) >= 120
 
 
 def test_duration_for_fast_ignores_steps():
-    """Fast is a fixed budget regardless of steps."""
-    assert backend.duration_for("compose", {"speed": "Fast", "steps": 100}) == 180
-
-
-def test_duration_for_quality_default_steps():
-    # Quality reserves the full window (matches the official Space's 180 s).
-    result = backend.duration_for("edit", {"speed": "Quality"})
-    assert result == 180
-    assert 60 <= result <= 180
-
-
-def test_duration_for_quality_40_steps_explicit():
-    result = backend.duration_for("edit", {"speed": "Quality", "steps": 40})
-    assert result == 180
-    assert 60 <= result <= 180
-
-
-def test_duration_for_quality_ignores_low_steps():
-    # Quality is a fixed 180 s budget regardless of the step count.
-    assert backend.duration_for("edit", {"speed": "Quality", "steps": 0}) == 180
-
-
-def test_duration_for_clamps_to_maximum():
-    # steps=1000: 30 + 1000 * 3.5 = 3530, clamped down to 180
-    result = backend.duration_for("edit", {"speed": "Quality", "steps": 1000})
-    assert result == 180
-
-
-def test_duration_for_quality_ge_fast():
-    # Both presets reserve the full 180 s window (the per-call unpack dominates).
-    quality = backend.duration_for("edit", {"speed": "Quality", "steps": 40})
-    fast = backend.duration_for("edit", {"speed": "Fast"})
-    assert quality >= fast == 180
+    """Fast budget does not depend on the step count."""
+    assert backend.duration_for("compose", {"speed": "Fast", "steps": 100}) == backend.duration_for(
+        "compose", {"speed": "Fast"}
+    )
 
 
 def test_duration_for_returns_int():

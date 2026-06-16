@@ -21,15 +21,20 @@ def _identity(fn):
 
 
 def duration_for(mode: str, params: dict[str, Any]) -> int:
-    """ZeroGPU slot budget in seconds (returns the 180 s ceiling).
+    """ZeroGPU @spaces.GPU duration budget in seconds.
 
-    Measured on this Space: the per-call cost is dominated by the ~58 GB model's
-    GPU materialization (~130 s); each denoising step is only ~1.4 s. So both
-    presets need the full window the official Qwen-Image-Edit-2511 Space relies on.
-    Quality's step count is kept low enough (see app._speed_defaults) to finish
-    within this budget.
+    The Space runs on the RTX Pro 6000 Blackwell ZeroGPU fleet. The ~58 GB model
+    does not fit the ``large`` (48 GB) tier, so it runs on ``xlarge`` (96 GB),
+    which DOUBLES the requested duration for ZeroGPU's per-call ceiling check: a
+    180 s request is seen as 360 s and rejected ("ZeroGPU illegal duration: the
+    requested GPU duration (360s) is larger than the maximum allowed"). We
+    therefore cap the request below that ceiling while still covering the ~130 s
+    model materialization incurred on every call. 145 s (→ 290 s requested) is
+    the duration-tuned probe value; Fast (4 steps, ~6 s) is the preset that can
+    realistically fit. Quality (more steps) likely overruns this budget on
+    xlarge and is the open question this probe informs.
     """
-    return 180
+    return 145
 
 
 def _duration_arg(*args: Any, **kwargs: Any) -> int:
