@@ -59,17 +59,17 @@ def test_duration_for_covers_materialization():
     """Budget must cover the ~15-40 s per-call model materialization plus
     inference, else the GPU task aborts mid-load."""
     for params in _DURATION_CASES:
-        assert backend.duration_for("edit", params) >= 70
+        assert backend.duration_for("edit", params) >= 50
 
 
 def test_duration_for_scales_with_steps_and_caps():
     """Duration grows with the step count (more denoising = more time) but is
-    capped so the doubled xlarge request stays under the ceiling."""
+    capped so the doubled xlarge request stays under the ~120 s ceiling."""
     fast = backend.duration_for("edit", {"speed": "Fast", "steps": 4})
     quality = backend.duration_for("edit", {"speed": "Quality", "steps": 40})
     assert quality > fast
     # Capped: even an extreme step count stays at the ceiling-safe maximum.
-    assert backend.duration_for("edit", {"speed": "Quality", "steps": 1000}) == 120
+    assert backend.duration_for("edit", {"speed": "Quality", "steps": 1000}) == 58
 
 
 def test_duration_for_returns_int():

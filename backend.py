@@ -25,16 +25,20 @@ def duration_for(mode: str, params: dict[str, Any]) -> int:
 
     The Space runs on the RTX Pro 6000 Blackwell ZeroGPU fleet, on the ``xlarge``
     (96 GB) tier because the ~58 GB model does not fit ``large`` (48 GB). xlarge
-    DOUBLES the requested duration for ZeroGPU's per-call ceiling check, and
-    requests at/above ~290 s are rejected ("ZeroGPU illegal duration"). Measured
-    from the Space logs, the 58 GB model packs at startup and materializes to the
-    GPU in only ~15-40 s (~6 GB/s), then ~1.4 s per denoising step — so a small
-    budget suffices. We scale the budget with the step count and cap it so that
-    ``2 * duration`` stays safely under the ceiling: Fast (4 steps) → 78 s
-    (156 s requested); Quality (≤40 steps) → 120 s (240 s requested).
+    DOUBLES the requested duration for ZeroGPU's per-call ceiling check. Live
+    probing showed 290 s and 156 s requests both rejected ("ZeroGPU illegal
+    duration"), so the per-call ceiling is ~120 s requested (ZeroGPU's documented
+    max) — i.e. real duration must be ≲ 60 s on xlarge. The 58 GB model packs at
+    startup and materializes to the GPU in only ~15-40 s (~6 GB/s, per the Space
+    logs) + ~1.4 s/step, so Fast (4 steps) fits comfortably in this budget.
+
+    Fast (4 steps) → 54 s (108 s requested, under the ceiling). Quality (more
+    steps) needs ~80 s real (~160 s requested) which exceeds the ceiling, so it
+    cannot fit on xlarge and would require fp8 (to reach the 1x ``large`` tier);
+    it is capped here at 58 s and will abort until that lands.
     """
     steps = int(params.get("steps", 4))
-    return min(120, 70 + steps * 2)
+    return min(58, 50 + steps)
 
 
 def _duration_arg(*args: Any, **kwargs: Any) -> int:
