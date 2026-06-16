@@ -22,6 +22,11 @@ peft
 
 torch>=2.5
 torchvision
+
+# torchao provides the fp8 weight-only quantization used in backend._build_pipeline
+# (Float8WeightOnlyConfig) to shrink the transformer ~40GB->~20GB so the ZeroGPU
+# per-call materialization fits the proxy-token TTL.
+torchao
 pillow>=10.4
 numpy>=1.26
 
