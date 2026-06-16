@@ -56,17 +56,20 @@ def test_duration_for_legal_on_xlarge():
 
 
 def test_duration_for_covers_materialization():
-    """Budget must be high enough to cover most of the ~130 s per-call model
-    materialization, else the GPU task aborts mid-load."""
+    """Budget must cover the ~15-40 s per-call model materialization plus
+    inference, else the GPU task aborts mid-load."""
     for params in _DURATION_CASES:
-        assert backend.duration_for("edit", params) >= 120
+        assert backend.duration_for("edit", params) >= 70
 
 
-def test_duration_for_fast_ignores_steps():
-    """Fast budget does not depend on the step count."""
-    assert backend.duration_for("compose", {"speed": "Fast", "steps": 100}) == backend.duration_for(
-        "compose", {"speed": "Fast"}
-    )
+def test_duration_for_scales_with_steps_and_caps():
+    """Duration grows with the step count (more denoising = more time) but is
+    capped so the doubled xlarge request stays under the ceiling."""
+    fast = backend.duration_for("edit", {"speed": "Fast", "steps": 4})
+    quality = backend.duration_for("edit", {"speed": "Quality", "steps": 40})
+    assert quality > fast
+    # Capped: even an extreme step count stays at the ceiling-safe maximum.
+    assert backend.duration_for("edit", {"speed": "Quality", "steps": 1000}) == 120
 
 
 def test_duration_for_returns_int():

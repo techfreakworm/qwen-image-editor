@@ -23,18 +23,18 @@ def _identity(fn):
 def duration_for(mode: str, params: dict[str, Any]) -> int:
     """ZeroGPU @spaces.GPU duration budget in seconds.
 
-    The Space runs on the RTX Pro 6000 Blackwell ZeroGPU fleet. The ~58 GB model
-    does not fit the ``large`` (48 GB) tier, so it runs on ``xlarge`` (96 GB),
-    which DOUBLES the requested duration for ZeroGPU's per-call ceiling check: a
-    180 s request is seen as 360 s and rejected ("ZeroGPU illegal duration: the
-    requested GPU duration (360s) is larger than the maximum allowed"). We
-    therefore cap the request below that ceiling while still covering the ~130 s
-    model materialization incurred on every call. 145 s (→ 290 s requested) is
-    the duration-tuned probe value; Fast (4 steps, ~6 s) is the preset that can
-    realistically fit. Quality (more steps) likely overruns this budget on
-    xlarge and is the open question this probe informs.
+    The Space runs on the RTX Pro 6000 Blackwell ZeroGPU fleet, on the ``xlarge``
+    (96 GB) tier because the ~58 GB model does not fit ``large`` (48 GB). xlarge
+    DOUBLES the requested duration for ZeroGPU's per-call ceiling check, and
+    requests at/above ~290 s are rejected ("ZeroGPU illegal duration"). Measured
+    from the Space logs, the 58 GB model packs at startup and materializes to the
+    GPU in only ~15-40 s (~6 GB/s), then ~1.4 s per denoising step — so a small
+    budget suffices. We scale the budget with the step count and cap it so that
+    ``2 * duration`` stays safely under the ceiling: Fast (4 steps) → 78 s
+    (156 s requested); Quality (≤40 steps) → 120 s (240 s requested).
     """
-    return 145
+    steps = int(params.get("steps", 4))
+    return min(120, 70 + steps * 2)
 
 
 def _duration_arg(*args: Any, **kwargs: Any) -> int:
