@@ -6,6 +6,7 @@ colorTo: indigo
 sdk: gradio
 sdk_version: "5.50.0"
 app_file: app.py
+short_description: "In active development — please don't run inference yet."
 python_version: "3.11"
 suggested_hardware: zero-a10g
 hf_oauth: false
@@ -16,6 +17,10 @@ preload_from_hub:
 
 # Qwen Image Editor
 
+> ### 🚧 Active development — please don't run inference
+>
+> This Space is **public and credit-backed**. Running the demo right now burns the maintainer's HF&nbsp;ZeroGPU credits while the app is still being tested. **Please hold off for now** — thanks for your patience! 🙏
+
 A focused Gradio app that wraps [Qwen/Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511) under two tabs — **Edit** (single-image instruction following) and **Compose** (blend up to three reference images into one scene). Runs locally on NVIDIA CUDA, deploys to Hugging Face Spaces (ZeroGPU). Fast mode drives the [Lightning LoRA](https://huggingface.co/lightx2v/Qwen-Image-Edit-2511-Lightning) at 4 steps; Quality mode runs the full 40-step pipeline.
 
 [![Spaces](https://img.shields.io/badge/%F0%9F%A4%97%20Spaces-Live-7C5CFF?style=flat-square)](https://huggingface.co/spaces/techfreakworm/qwen-image-editor)
@@ -24,7 +29,8 @@ A focused Gradio app that wraps [Qwen/Qwen-Image-Edit-2511](https://huggingface.
 [![Python 3.11](https://img.shields.io/badge/Python-3.11-7C5CFF?style=flat-square&logo=python&logoColor=white)](pyproject.toml)
 [![Backend: diffusers](https://img.shields.io/badge/backend-diffusers-7C5CFF?style=flat-square)](https://github.com/huggingface/diffusers)
 
-→ **Live demo:** https://huggingface.co/spaces/techfreakworm/qwen-image-editor
+→ **Live demo:** https://huggingface.co/spaces/techfreakworm/qwen-image-editor  
+*(in active development — please don't run inference; it burns the maintainer's ZeroGPU credits)*
 
 ---
 

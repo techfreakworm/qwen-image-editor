@@ -96,6 +96,19 @@ def on_compose_generate(
 
 # ----- HTML blocks -----------------------------------------------------------
 
+# Prominent active-development banner. The Space is public and credit-backed, so
+# this asks visitors not to run inference while the app is still being tested
+# (mirrors the wan-studio notice). Shown at the very top of the app.
+BANNER_HTML = """
+<div style="background:#3a2a12;border:1px solid #7a5a1e;border-radius:8px;
+            padding:12px 16px;margin:4px 0 10px 0;color:#f0d8a8;font-size:13px;
+            line-height:1.55;text-align:center;">
+  🚧 <strong style="color:#ffcf6b;">Active development — please don't run inference.</strong><br>
+  This demo is <strong>public &amp; credit-backed</strong>; running it right now burns the
+  maintainer's HF&nbsp;ZeroGPU credits while we're still testing. Please hold off — thank you! 🙏
+</div>
+""".strip()
+
 HEADER_HTML = """
 <div style="display:flex;justify-content:space-between;align-items:baseline;padding:8px 0 4px 0;">
   <div style="font-size:16px;font-weight:600;letter-spacing:-0.01em;">
@@ -122,6 +135,7 @@ CTA_HTML = """
 
 def build_app() -> gr.Blocks:
     with gr.Blocks(theme=theme.build_theme(), css=theme.CSS, title="Qwen Image Editor") as demo:
+        gr.HTML(BANNER_HTML)
         gr.HTML(HEADER_HTML)
         gr.HTML(CTA_HTML)
 
