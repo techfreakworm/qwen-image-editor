@@ -23,22 +23,25 @@ def _identity(fn):
 def duration_for(mode: str, params: dict[str, Any]) -> int:
     """ZeroGPU @spaces.GPU duration budget in seconds.
 
-    The Space runs on the RTX Pro 6000 Blackwell ZeroGPU fleet, on the ``xlarge``
-    (96 GB) tier because the ~58 GB model does not fit ``large`` (48 GB). xlarge
-    DOUBLES the requested duration for ZeroGPU's per-call ceiling check. Live
-    probing showed 290 s and 156 s requests both rejected ("ZeroGPU illegal
-    duration"), so the per-call ceiling is ~120 s requested (ZeroGPU's documented
-    max) — i.e. real duration must be ≲ 60 s on xlarge. The 58 GB model packs at
-    startup and materializes to the GPU in only ~15-40 s (~6 GB/s, per the Space
-    logs) + ~1.4 s/step, so Fast (4 steps) fits comfortably in this budget.
+    On the ``xlarge`` ZeroGPU tier (the ~58 GB model needs 96 GB) the request is
+    DOUBLED for the per-call ceiling check. Confirmed live: duration=180 (360 s
+    requested) is rejected ("ZeroGPU illegal duration"), while duration=54
+    (108 s requested) is ACCEPTED but the task is "GPU task aborted" — the
+    per-call execution (model materialization + inference) exceeds a 54 s budget.
+    So we want the highest legal budget: 145 s (290 s requested, just under the
+    360 s that was rejected). If even this aborts, the 58 GB bf16 model is too
+    slow per-call for xlarge and needs fp8 (to reach the 1x ``large`` tier).
 
-    Fast (4 steps) → 54 s (108 s requested, under the ceiling). Quality (more
-    steps) needs ~80 s real (~160 s requested) which exceeds the ceiling, so it
-    cannot fit on xlarge and would require fp8 (to reach the 1x ``large`` tier);
-    it is capped here at 58 s and will abort until that lands.
+    Override via the ``QIE_GPU_DURATION`` Space variable to retune the budget
+    without a code redeploy (a Space restart picks it up).
     """
-    steps = int(params.get("steps", 4))
-    return min(58, 50 + steps)
+    override = os.environ.get("QIE_GPU_DURATION")
+    if override:
+        try:
+            return int(override)
+        except ValueError:
+            pass
+    return 145
 
 
 def _duration_arg(*args: Any, **kwargs: Any) -> int:

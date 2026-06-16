@@ -62,14 +62,20 @@ def test_duration_for_covers_materialization():
         assert backend.duration_for("edit", params) >= 50
 
 
-def test_duration_for_scales_with_steps_and_caps():
-    """Duration grows with the step count (more denoising = more time) but is
-    capped so the doubled xlarge request stays under the ~120 s ceiling."""
-    fast = backend.duration_for("edit", {"speed": "Fast", "steps": 4})
-    quality = backend.duration_for("edit", {"speed": "Quality", "steps": 40})
-    assert quality > fast
-    # Capped: even an extreme step count stays at the ceiling-safe maximum.
-    assert backend.duration_for("edit", {"speed": "Quality", "steps": 1000}) == 58
+def test_duration_for_returns_legal_int():
+    """Default budget is a positive int whose doubled xlarge request stays under
+    the 360 s value ZeroGPU rejected."""
+    d = backend.duration_for("edit", {"speed": "Fast", "steps": 4})
+    assert isinstance(d, int)
+    assert 60 <= d * 2 < 360
+
+
+def test_duration_for_env_override(monkeypatch):
+    """QIE_GPU_DURATION retunes the budget without a code change; junk is ignored."""
+    monkeypatch.setenv("QIE_GPU_DURATION", "100")
+    assert backend.duration_for("edit", {"speed": "Fast", "steps": 4}) == 100
+    monkeypatch.setenv("QIE_GPU_DURATION", "not-an-int")
+    assert isinstance(backend.duration_for("edit", {"speed": "Fast"}), int)
 
 
 def test_duration_for_returns_int():
