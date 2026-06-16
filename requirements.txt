@@ -26,7 +26,11 @@ torchvision
 # torchao provides the fp8 weight-only quantization used in backend._build_pipeline
 # (Float8WeightOnlyConfig) to shrink the transformer ~40GB->~20GB so the ZeroGPU
 # per-call materialization fits the proxy-token TTL.
-torchao
+# PINNED to 0.12.0: the pinned diffusers commit (973a077, Dec 2025) imports
+# `torchao.dtypes.floatx.float8_layout.Float8AQTTensorImpl`, which newer torchao
+# removed/moved — an unpinned (latest) torchao crashes the diffusers import at
+# startup. 0.12.0 still has that module path.
+torchao==0.12.0
 pillow>=10.4
 numpy>=1.26
 
