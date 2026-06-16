@@ -5,11 +5,13 @@ gradio==5.50.0
 # ZeroGPU build time. Pinning it would cause a pip resolution conflict with the injected
 # package and break the Space build.
 
-# diffusers is pinned to the exact commit used by the official Qwen/Qwen-Image-Edit-2511
-# Space (https://huggingface.co/spaces/Qwen/Qwen-Image-Edit-2511). This ensures
-# QwenImageEditPlusPipeline and FlowMatchEulerDiscreteScheduler APIs are stable and
-# match the Lightning LoRA scheduler config that was tested against that commit.
-diffusers @ git+https://github.com/huggingface/diffusers.git@973a077c6a4e7e7a7ea61a84bedd29ac24fb609a
+# diffusers: UNPINNED from the official Qwen Space commit (973a077, Dec 2025).
+# That commit's torchao-quantizer integration is incompatible with BOTH the
+# latest torchao AND the Space's ZeroGPU-injected (newer) torch, and no
+# torchao/quanto version satisfies all three. ZeroGPU controls torch, so we raise
+# diffusers to latest main, whose quantizer integration matches the current
+# torchao module layout. (Re-verify Fast mode / Lightning scheduler after a bump.)
+diffusers @ git+https://github.com/huggingface/diffusers.git
 
 transformers
 accelerate
@@ -23,14 +25,11 @@ peft
 torch>=2.5
 torchvision
 
-# optimum-quanto provides the fp8 (qfloat8) weight-only quantization used in
-# backend._build_pipeline to shrink the transformer ~40GB->~20GB so the ZeroGPU
-# per-call materialization fits the proxy-token TTL.
-# We use quanto (NOT torchao) on purpose: diffusers@973a077 eagerly imports its
-# torchao quantizer at pipeline-import time, and no torchao version is compatible
-# with BOTH that pinned diffusers AND the Space's (newer) torch. quanto quantizes
-# the model directly and does not trip diffusers' quantizer imports.
-optimum-quanto
+# torchao (latest) provides the fp8 weight-only quantization (Float8WeightOnlyConfig)
+# used in backend._build_pipeline to shrink the transformer ~40GB->~20GB so the
+# ZeroGPU per-call materialization fits the proxy-token TTL. Paired with the
+# bumped (latest) diffusers, whose torchao integration matches current torchao.
+torchao
 pillow>=10.4
 numpy>=1.26
 
