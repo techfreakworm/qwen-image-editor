@@ -107,6 +107,21 @@ def on_compose_generate(
 
 # ----- HTML blocks -----------------------------------------------------------
 
+# ZeroGPU quota caution (Spaces only — there's no quota locally on MPS/CUDA). The ~20B
+# model needs the 96 GB `xlarge` tier, which bills 2x the daily ZeroGPU quota; within that,
+# cost tracks GPU time (Fast < Quality < Compose). Shown so visitors know what they spend.
+QUOTA_BANNER_HTML = """
+<div style="background:#2a2410;border:1px solid #6e5a1e;border-radius:8px;
+            padding:10px 14px;margin:4px 0 10px 0;color:#ecd9a0;font-size:12.5px;
+            line-height:1.5;text-align:center;">
+  ⚡ Runs on ZeroGPU <strong>xlarge</strong> — each generation uses
+  <strong style="color:#ffcf6b;">2&times; your daily ZeroGPU quota</strong>
+  (the&nbsp;20B model needs the full 96&nbsp;GB GPU; there's no 1&times; tier it fits).
+  <strong>Fast</strong> is cheapest; <strong>Quality</strong> and <strong>Compose</strong>
+  use more GPU&nbsp;time. Generations draw on <strong>your own</strong> HF ZeroGPU allowance.
+</div>
+""".strip()
+
 HEADER_HTML = """
 <div style="display:flex;justify-content:space-between;align-items:baseline;padding:8px 0 4px 0;">
   <div style="font-size:16px;font-weight:600;letter-spacing:-0.01em;">
@@ -133,6 +148,9 @@ CTA_HTML = """
 
 def build_app() -> gr.Blocks:
     with gr.Blocks(theme=theme.build_theme(), css=theme.CSS, title="Qwen Image Editor") as demo:
+        # Quota caution applies only to the public ZeroGPU Space (no quota locally).
+        if models.on_spaces():
+            gr.HTML(QUOTA_BANNER_HTML)
         gr.HTML(HEADER_HTML)
         gr.HTML(CTA_HTML)
 
