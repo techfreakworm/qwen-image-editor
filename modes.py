@@ -3,11 +3,32 @@
 from __future__ import annotations
 
 import random
+import threading
 from typing import Any
 
 from PIL import Image
 
 import models
+
+# Serialize MPS inference: one GPU, one shared pipeline whose scheduler/adapter are
+# swapped per request. Two concurrent runs would race that state + corrupt the
+# memory peak measurement + race the calibration cache. (The app also caps queue
+# concurrency to 1; this is correct-by-construction belt-and-suspenders.)
+_MPS_LOCK = threading.Lock()
+
+
+def _is_mps_oom(e: BaseException) -> bool:
+    """True for any MPS allocation-failure RuntimeError.
+
+    Covers BOTH the raw allocator OOM ("MPS backend out of memory") AND the high-watermark
+    throw (a DIFFERENT message) — otherwise watermark-triggered failures would escape the
+    OOM-retry net and crash, defeating the never-OOM guarantee.
+    """
+    s = str(e).lower()
+    return any(
+        k in s
+        for k in ("out of memory", "watermark", "mps allocated", "cannot allocate", "insufficient memory")
+    )
 
 
 def _apply_speed(pipe: Any, speed: str) -> None:
@@ -28,49 +49,128 @@ def _apply_speed(pipe: Any, speed: str) -> None:
 def _run(pipe: Any, params: dict[str, Any]) -> tuple[Image.Image, dict[str, Any]]:
     """Run inference and return (output_image, metadata).
 
-    Validates that at least one image is present, applies the speed mode,
-    resolves image dimensions and seed, then calls the pipeline.
+    Validates that at least one image is present, applies the speed mode, resolves
+    dimensions and seed, then calls the pipeline. On MPS an OOM preflight runs first:
+    it sizes the request against a live memory budget and auto-degrades down a ladder
+    (resolution -> refs -> drop CFG double-pass -> Quality->Fast) so inference never
+    OOMs; the math + any degradation are surfaced in meta. The CUDA/CPU path is
+    unchanged.
     """
     images: list[Any] = params["images"]
     if not images:
         raise ValueError("at least one image is required; params['images'] is empty")
 
-    _apply_speed(pipe, params["speed"])
+    import torch  # deferred — CI has no torch installed
 
-    w, h = models.fit_dimensions(images[0])
+    # Normalize device: pipe.device may be a str or a torch.device object.
+    device = str(getattr(pipe, "device", "cpu"))
+    is_mps = device.split(":")[0] == "mps"
+
+    mode = params["mode"]
+    speed = params["speed"]
+    steps = int(params["steps"])
+    true_cfg = float(params["true_cfg"])
+    prompt = params["prompt"]
+    negative_prompt = params["negative_prompt"]
 
     seed_in = params["seed"]
     seed = random.randint(0, 2**32 - 1) if seed_in < 0 else int(seed_in)
 
-    import torch  # deferred — CI has no torch installed
+    # --- CUDA / CPU / mocked path (unchanged behaviour) ---------------------------------
+    if not is_mps:
+        _apply_speed(pipe, speed)
+        w, h = models.fit_dimensions(images[0])
+        gen = torch.Generator(device).manual_seed(seed)
+        out = pipe(
+            image=images,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            true_cfg_scale=true_cfg,
+            num_inference_steps=steps,
+            height=h,
+            width=w,
+            generator=gen,
+        )
+        meta = {
+            "mode": mode, "speed": speed, "steps": steps, "true_cfg": true_cfg,
+            "seed": seed, "width": w, "height": h, "num_inputs": len(images),
+        }
+        return out.images[0], meta
 
-    # Normalize device: pipe.device may be a str or a torch.device object.
-    # str(torch.device("cuda:0")) == "cuda:0", str("cpu") == "cpu" — safe in both cases.
-    device = str(getattr(pipe, "device", "cpu"))
-    gen = torch.Generator(device).manual_seed(seed)
+    # --- MPS path: serialized, OOM-preflight + reactive degrade-on-OOM -------------------
+    import gc
 
-    out = pipe(
-        image=images,
-        prompt=params["prompt"],
-        negative_prompt=params["negative_prompt"],
-        true_cfg_scale=params["true_cfg"],
-        num_inference_steps=params["steps"],
-        height=h,
-        width=w,
-        generator=gen,
-    )
+    import memory
 
-    meta: dict[str, Any] = {
-        "mode": params["mode"],
-        "speed": params["speed"],
-        "steps": params["steps"],
-        "true_cfg": params["true_cfg"],
-        "seed": seed,
-        "width": w,
-        "height": h,
-        "num_inputs": len(images),
-    }
-    return out.images[0], meta
+    with _MPS_LOCK:
+        gc.collect()
+        torch.mps.empty_cache()
+        base_w, base_h = images[0].size
+        n_ref0 = max(0, len(images) - 1)
+        plan = memory.plan_request(device, mode, base_w, base_h, n_ref0, speed, steps, true_cfg)
+        if plan["refused"]:
+            raise RuntimeError(plan["note"])
+
+        w, h = plan["width"], plan["height"]
+        steps, true_cfg, speed, n_ref = plan["steps"], plan["true_cfg"], plan["speed"], plan["n_ref"]
+        degrades = list(plan["degrades"])
+
+        out = None
+        last_err: Exception | None = None
+        for _attempt in range(8):  # bounded reactive degrade — hard never-OOM guarantee
+            imgs = images[: n_ref + 1]
+            _apply_speed(pipe, speed)
+            gen = torch.Generator("cpu").manual_seed(seed)  # MPS generator is flaky
+            peak0 = torch.mps.driver_allocated_memory()
+            try:
+                out = pipe(
+                    image=imgs,
+                    prompt=prompt,
+                    negative_prompt=negative_prompt,
+                    true_cfg_scale=true_cfg,
+                    num_inference_steps=steps,
+                    height=h,
+                    width=w,
+                    generator=gen,
+                )
+                break
+            except RuntimeError as e:
+                if not _is_mps_oom(e):
+                    raise
+                last_err = e
+                del gen
+                gc.collect()
+                torch.mps.synchronize()
+                torch.mps.empty_cache()
+                # Self-correct AFTER cleanup: at the OOM instant the heap is at its sticky
+                # peak, so activation_budget_gb would read used≈peak -> budget≈0 -> no-op
+                # penalty. With a clean heap it returns the real budget the config overflowed,
+                # so the next identical request degrades preemptively instead of re-OOMing.
+                memory.penalize(h, w, n_ref, true_cfg > 1.0, memory.activation_budget_gb(device))
+                nxt = memory.step_down(w, h, n_ref, speed, true_cfg, steps, base_w, base_h, mode)
+                if nxt is None:
+                    raise RuntimeError(f"MPS OOM at the smallest config and cannot degrade further: {e}") from e
+                w, h, n_ref = nxt["width"], nxt["height"], nxt["n_ref"]
+                speed, true_cfg, steps = nxt["speed"], nxt["true_cfg"], nxt["steps"]
+                degrades.append(f"OOM-retry->{w}x{h} {speed} {n_ref + 1}img")
+        if out is None:  # pragma: no cover - defensive
+            raise RuntimeError(f"MPS inference failed after retries: {last_err}")
+
+        peak_gb = max(0.0, (torch.mps.driver_allocated_memory() - peak0) / (1024**3))
+        memory.record_peak(mode, h, w, n_ref, true_cfg > 1.0, peak_gb)
+
+        meta = {
+            "mode": mode, "speed": speed, "steps": steps, "true_cfg": true_cfg,
+            "seed": seed, "width": w, "height": h, "num_inputs": n_ref + 1,
+            "preflight": plan["note"], "budget_gb": plan["budget_gb"],
+            "need_gb": plan["need_gb"], "measured_peak_gb": round(peak_gb, 1),
+        }
+        if degrades:
+            meta["degrades"] = degrades
+
+        gc.collect()
+        torch.mps.empty_cache()
+        return out.images[0], meta
 
 
 def call_edit(pipe: Any, params: dict[str, Any]) -> tuple[Image.Image, dict[str, Any]]:

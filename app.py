@@ -8,6 +8,17 @@ import os
 # doesn't implement. Must be set before any torch-touching import path is taken.
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
+# MPS allocator watermarks (relative to recommended_max ~107.5 GB; ignored off-MPS).
+# These MUST be set before the first torch MPS touch — hence the very top of app.py,
+# before any torch-importing module. HIGH=1.0 (~107.5 GB) is the hard ceiling that turns
+# a memory overflow into a catchable RuntimeError (the OOM-retry in modes._run degrades
+# from it) instead of a swap-thrash hang. It sits a ~5 GB gap ABOVE the preflight budget
+# cap (0.95*recommended ~102 GB) so allocator fragmentation on a legitimately-approved run
+# doesn't spuriously throw. LOW=0.9 (~96.75 GB) is the cache-trim trigger, above the
+# common-mode peak so normal runs don't churn. (LOW must be < HIGH or torch rejects it.)
+os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.9")
+os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "1.0")
+
 import gradio as gr
 
 import backend
@@ -135,7 +146,10 @@ CTA_HTML = """
 
 def build_app() -> gr.Blocks:
     with gr.Blocks(theme=theme.build_theme(), css=theme.CSS, title="Qwen Image Editor") as demo:
-        gr.HTML(BANNER_HTML)
+        # The "don't run inference" banner only applies to the public credit-backed
+        # HF ZeroGPU Space; locally (CUDA/MPS) the app is meant to be run.
+        if models.on_spaces():
+            gr.HTML(BANNER_HTML)
         gr.HTML(HEADER_HTML)
         gr.HTML(CTA_HTML)
 
