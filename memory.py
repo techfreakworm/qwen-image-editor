@@ -30,7 +30,8 @@ GB = 1024**3
 RESIDENT_GB = 58.0
 LORA_GB = 1.0  # Lightning adapter is always loaded (toggled, not unloaded)
 LOAD_TRANSIENT_GB = 5.0  # shard materialization transient during from_pretrained
-DEFAULT_RESERVE_GB = 20.0  # OS + other sessions + macOS 'available' is an estimate
+DEFAULT_RESERVE_GB = 20.0  # OS + other sessions + macOS 'available' is an estimate (MPS, shared RAM)
+DEFAULT_CUDA_RESERVE_GB = 3.0  # CUDA context + allocator fragmentation (dedicated VRAM, not shared)
 
 # --- Activation model (recalibrated from MEASURED MPS peaks, fresh-process) -------------
 # Measured driver_allocated peaks @ 1024^2 output: edit/Fast n_img=1 -> 28.1, edit/Quality
@@ -47,6 +48,17 @@ _ACT_BASE = 18.0  # fixed overhead (Metal/kernel caches, fragmentation, base buf
 _ACT_PER_IMG = 13.5  # GB per input image (VL 384^2 + VAE 1MP encode + input latent tokens)
 _ACT_DENOISE = 0.5  # GB per (n_img+1)*MP_out*cfg_fac (output denoise + VAE decode; small)
 
+# CUDA coefficients are ~8x LOWER than MPS: on CUDA the model uses FlashAttention/efficient
+# SDPA, which does NOT materialize the large attention tensors that MPS does. MEASURED on
+# ZeroGPU (RTX Pro 6000): edit/Fast n_img=1 @1024^2 peak ABOVE the resident baseline = 4.2 GB
+# (vs the MPS formula's ~32 GB). These are conservative (~3x the measurement) so the first
+# run of every Edit/Compose/Quality config fits the ~37 GB free without a FALSE degrade;
+# the device-keyed calibration (trust-calib on CUDA) then refines each config to its real
+# ~4-10 GB, and the catchable-CUDA-OOM retry remains the hard never-OOM backstop.
+_ACT_BASE_CUDA = 8.0
+_ACT_PER_IMG_CUDA = 6.0
+_ACT_DENOISE_CUDA = 0.6
+
 # Resolution rungs (max_pixels) for the degrade ladder — the dominant lever.
 RES_RUNGS = (1024 * 1024, 896 * 896, 768 * 768, 640 * 640)
 
@@ -62,6 +74,13 @@ def _reserve_gb() -> float:
         return float(os.environ.get("QIE_MPS_RESERVE_GB", DEFAULT_RESERVE_GB))
     except (TypeError, ValueError):
         return DEFAULT_RESERVE_GB
+
+
+def _cuda_reserve_gb() -> float:
+    try:
+        return float(os.environ.get("QIE_CUDA_RESERVE_GB", DEFAULT_CUDA_RESERVE_GB))
+    except (TypeError, ValueError):
+        return DEFAULT_CUDA_RESERVE_GB
 
 
 def available_gb() -> float:
@@ -108,24 +127,29 @@ def fit_dims(base_w: int, base_h: int, max_pixels: int, multiple: int = 16) -> t
     return w, h
 
 
-def activation_gb(height: int, width: int, n_ref: int, cfg_on: bool) -> float:
+def activation_gb(height: int, width: int, n_ref: int, cfg_on: bool, device: str = "mps") -> float:
     """Conservative (over-estimating) peak activation memory (GB) for one inference.
 
-    Recalibrated to MEASURED MPS peaks (upper envelope + margin). ``n_img`` = 1 + n_ref
-    input images. The per-image encode term (_ACT_PER_IMG) is fixed in output resolution
-    because the pipeline auto-resizes every input to fixed areas (CONDITION 384^2 + VAE
-    1024^2); only the denoise/decode term scales with output MP. ``cfg_on`` (true_cfg>1)
-    doubles ONLY the denoise term — the VL/VAE conditioning is computed once and reused
-    for the cond+uncond passes, so it gets no cfg factor.
+    Device-specific coefficients: MPS uses the big upper-envelope (it materializes attention
+    tensors); CUDA uses ~8x lower coefficients (FlashAttention; measured ~4 GB for edit/Fast
+    1-img). ``n_img`` = 1 + n_ref input images. The per-image encode term is ~fixed in output
+    resolution (the pipeline auto-resizes inputs to fixed areas); only the denoise/decode term
+    scales with output MP. ``cfg_on`` (true_cfg>1) doubles ONLY the denoise term — the VL/VAE
+    conditioning is computed once and reused for the cond+uncond passes.
     """
+    base, per_img, denoise = (
+        (_ACT_BASE_CUDA, _ACT_PER_IMG_CUDA, _ACT_DENOISE_CUDA)
+        if device == "cuda"
+        else (_ACT_BASE, _ACT_PER_IMG, _ACT_DENOISE)
+    )
     n_img = 1 + n_ref
     mp_out = (height * width) / (1024 * 1024)
     cfg_fac = 2 if cfg_on else 1
-    return _ACT_BASE + _ACT_PER_IMG * n_img + _ACT_DENOISE * (n_img + 1) * mp_out * cfg_fac
+    return base + per_img * n_img + denoise * (n_img + 1) * mp_out * cfg_fac
 
 
-def _act_estimate(height: int, width: int, n_ref: int, cfg_on: bool) -> float:
-    """Activation-only estimate (GB) — an UPWARD-ONLY ratchet over the formula.
+def _act_estimate(device: str, height: int, width: int, n_ref: int, cfg_on: bool) -> float:
+    """Activation-only estimate (GB), device-aware.
 
     The formula is already re-fit to measured reality (+margin), so a calibrated value
     BELOW it carries no information, only risk: a low cross-request driver-delta (e.g. the
@@ -135,8 +159,20 @@ def _act_estimate(height: int, width: int, n_ref: int, cfg_on: bool) -> float:
     only RAISE the estimate above the formula, never lower it. record_peak still ratchets
     up for genuinely-higher fragmented peaks.
     """
-    key = ("act", _res_bucket(height, width), n_ref, cfg_on)
-    return max(activation_gb(height, width, n_ref, cfg_on), _CALIB.get(key, 0.0))
+    key = (device, "act", _res_bucket(height, width), n_ref, cfg_on)
+    formula = activation_gb(height, width, n_ref, cfg_on, device)
+    calib = _CALIB.get(key)
+    if calib is None:
+        return formula
+    if device == "cuda":
+        # CUDA has an ACCURATE peak counter (reset_peak_memory_stats + max_memory_allocated),
+        # so a recorded peak REPLACES the (MPS-derived, inflated) formula — letting Compose
+        # relax to CUDA reality (~25-30 GB) instead of being pinned at ~46 GB and forever
+        # over-degrading on a 96 GB GPU. record_peak floors it at _ACT_BASE.
+        return calib
+    # MPS: UPWARD-ONLY ratchet — the driver-delta is an unreliable sticky-heap proxy, so
+    # calibration can only RAISE the conservative formula, never lower it below the real peak.
+    return max(formula, calib)
 
 
 def activation_budget_gb(device: str) -> float:
@@ -149,6 +185,18 @@ def activation_budget_gb(device: str) -> float:
     against a post-load `available` would double-count the now-resident weights and
     spuriously refuse every request (observed in the first smoke test).
     """
+    if device == "cuda":
+        import torch
+
+        # Activation budget on CUDA = TOTAL VRAM - currently-ALLOCATED tensors - reserve.
+        # NOT mem_get_info()'s driver-"free": after loading the ~58 GB model the PyTorch
+        # caching allocator RESERVES most of VRAM, and the driver counts reserved-but-unused
+        # as "used" -> free reads ~0 -> we'd spuriously refuse every request (observed:
+        # "free 0 GB"). The activation reuses that reserved pool, so (total - allocated) is
+        # the real headroom. e.g. xlarge 96 GB - 58 allocated - 3 reserve = ~35 GB for acts.
+        _free_b, total_b = torch.cuda.mem_get_info()
+        allocated_b = torch.cuda.memory_allocated()
+        return max(0.0, (total_b - allocated_b) / GB - _cuda_reserve_gb())
     free = available_gb() - _reserve_gb()
     if device == "mps":
         import torch
@@ -164,18 +212,21 @@ def activation_budget_gb(device: str) -> float:
     return max(0.0, free)
 
 
-def record_peak(mode: str, height: int, width: int, n_ref: int, cfg_on: bool, measured_peak_gb: float) -> None:
+def record_peak(
+    device: str, mode: str, height: int, width: int, n_ref: int, cfg_on: bool, measured_peak_gb: float
+) -> None:
     """Record a measured activation peak for calibration (FIX #2: floor-guarded).
 
     Rejects an implausibly-small delta (driver heap released before the read, or a proxy
     miss) so the cache can never be poisoned toward ~0 — which would silently disable
     activation budgeting and cause an OOM. Keeps the max (x margin) across runs, never
-    below the physical floor.
+    below the physical floor. Cache is device-keyed (MPS driver-delta vs CUDA accurate
+    peak-counter measurements must never cross-pollute).
     """
     floor = _ACT_BASE  # any real inference allocates at least the base overhead
     if measured_peak_gb < floor:
         return
-    key = ("act", _res_bucket(height, width), n_ref, cfg_on)
+    key = (device, "act", _res_bucket(height, width), n_ref, cfg_on)
     _CALIB[key] = max(_CALIB.get(key, 0.0), measured_peak_gb * _CALIB_MARGIN)
 
 
@@ -247,7 +298,7 @@ def plan_request(
 
     for mp, nref_c, cfg_c, speed_c in candidates():
         w, h = fit_dims(base_w, base_h, mp)
-        act = _act_estimate(w, h, nref_c, cfg_c > 1.0)
+        act = _act_estimate(device, w, h, nref_c, cfg_c > 1.0)
         if act <= act_budget:
             degrades = []
             if nref_c < n_ref:
@@ -270,7 +321,7 @@ def plan_request(
 
     # Hard floor: even the bottom rung's activation overflows free memory.
     w, h = fit_dims(base_w, base_h, RES_RUNGS[-1])
-    act = _act_estimate(w, h, min_ref, False)
+    act = _act_estimate(device, w, h, min_ref, False)
     footprint = RESIDENT_GB + LORA_GB + act
     note = (
         f"OOM-REFUSED: even {w}x{h} Fast needs ~{act:.0f} GB activation > free {act_budget:.0f} GB "
@@ -287,7 +338,7 @@ def plan_request(
 
 def _note(act, act_budget, footprint, w, h, n_ref, quality, degrades) -> str:
     base = (
-        f"MPS preflight: activation ~{act:.0f} GB <= free {act_budget:.0f} GB "
+        f"OOM preflight: activation ~{act:.0f} GB <= free {act_budget:.0f} GB "
         f"(weights {RESIDENT_GB + LORA_GB:.0f} GB resident; peak footprint ~{footprint:.0f} GB) "
         f"@ {w}x{h}{' Q' if quality else ' F'}, {n_ref + 1} image(s)."
     )
@@ -296,14 +347,14 @@ def _note(act, act_budget, footprint, w, h, n_ref, quality, degrades) -> str:
     return base + " No degrade."
 
 
-def penalize(height: int, width: int, n_ref: int, cfg_on: bool, failed_budget_gb: float) -> None:
+def penalize(device: str, height: int, width: int, n_ref: int, cfg_on: bool, failed_budget_gb: float) -> None:
     """Self-correcting calibration after an ACTUAL OOM (qwen-brain Q2.2).
 
     Bumps this config's cached estimate above the budget it just overflowed, so the next
     identical request degrades preemptively in the preflight instead of repeating the
-    (multi-minute) OOM + retry loop every time the formula under-predicts.
+    OOM + retry loop. Device-keyed (per record_peak).
     """
-    key = ("act", _res_bucket(height, width), n_ref, cfg_on)
+    key = (device, "act", _res_bucket(height, width), n_ref, cfg_on)
     _CALIB[key] = max(_CALIB.get(key, 0.0), failed_budget_gb * 1.2)
 
 

@@ -25,11 +25,15 @@ peft
 torch>=2.5
 torchvision
 
-# torchao (latest) provides the fp8 weight-only quantization (Float8WeightOnlyConfig)
-# used in backend._build_pipeline to shrink the transformer ~40GB->~20GB so the
-# ZeroGPU per-call materialization fits the proxy-token TTL. Paired with the
-# bumped (latest) diffusers, whose torchao integration matches current torchao.
-torchao
+# psutil powers the pre-inference OOM preflight (system-memory budget on MPS; on
+# ZeroGPU/CUDA the budget keys off torch.cuda.mem_get_info instead).
+psutil
+
+# torchao is NO LONGER required: the default precision is full bf16 on every device
+# (the ~58 GB model fits the MPS unified pool and the ZeroGPU `xlarge` 96 GB tier with
+# no offload). fp8 weight-only quant (to fit the smaller 48 GB `large` tier) is opt-in
+# via QIE_USE_FP8=1 — if you enable it, also add `torchao` here. It was dropped because
+# the torchao/diffusers fp8 stack never stabilized on ZeroGPU.
 pillow>=10.4
 numpy>=1.26
 

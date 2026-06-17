@@ -14,21 +14,56 @@ import models
 # swapped per request. Two concurrent runs would race that state + corrupt the
 # memory peak measurement + race the calibration cache. (The app also caps queue
 # concurrency to 1; this is correct-by-construction belt-and-suspenders.)
-_MPS_LOCK = threading.Lock()
+_GPU_LOCK = threading.Lock()
 
 
-def _is_mps_oom(e: BaseException) -> bool:
-    """True for any MPS allocation-failure RuntimeError.
+def _is_gpu_oom(e: BaseException) -> bool:
+    """True for any GPU allocation-failure RuntimeError (MPS or CUDA).
 
-    Covers BOTH the raw allocator OOM ("MPS backend out of memory") AND the high-watermark
-    throw (a DIFFERENT message) — otherwise watermark-triggered failures would escape the
-    OOM-retry net and crash, defeating the never-OOM guarantee.
+    Covers the raw allocator OOM ("MPS backend out of memory" / "CUDA out of memory"),
+    the MPS high-watermark throw (a DIFFERENT message), and CUDA OOM variants — otherwise
+    those would escape the OOM-retry net and crash, defeating the never-OOM guarantee.
     """
     s = str(e).lower()
     return any(
         k in s
-        for k in ("out of memory", "watermark", "mps allocated", "cannot allocate", "insufficient memory")
+        for k in (
+            "out of memory", "watermark", "mps allocated", "cannot allocate",
+            "insufficient memory", "cuda error", "cublas",
+        )
     )
+
+
+def _gpu_empty_cache(torch: Any, dt: str) -> None:
+    if dt == "mps":
+        torch.mps.empty_cache()
+    elif dt == "cuda":
+        torch.cuda.empty_cache()
+
+
+def _gpu_synchronize(torch: Any, dt: str) -> None:
+    if dt == "mps":
+        torch.mps.synchronize()
+    elif dt == "cuda":
+        torch.cuda.synchronize()
+
+
+def _gpu_allocated_gb(torch: Any, dt: str) -> float:
+    """Currently-allocated GPU memory (GB) — the resident baseline before inference."""
+    if dt == "mps":
+        return torch.mps.driver_allocated_memory() / (1024**3)
+    if dt == "cuda":
+        return torch.cuda.memory_allocated() / (1024**3)
+    return 0.0
+
+
+def _gpu_peak_gb(torch: Any, dt: str, baseline_gb: float) -> float:
+    """Activation peak (GB) above the resident baseline, for calibration."""
+    if dt == "mps":
+        return max(0.0, torch.mps.driver_allocated_memory() / (1024**3) - baseline_gb)
+    if dt == "cuda":
+        return max(0.0, torch.cuda.max_memory_allocated() / (1024**3) - baseline_gb)
+    return 0.0
 
 
 def _apply_speed(pipe: Any, speed: str) -> None:
@@ -83,7 +118,15 @@ def _run(pipe: Any, params: dict[str, Any], progress: Any = None) -> tuple[Image
 
     # Normalize device: pipe.device may be a str or a torch.device object.
     device = str(getattr(pipe, "device", "cpu"))
-    is_mps = device.split(":")[0] == "mps"
+    device_type = device.split(":")[0]
+    # ZeroGPU quirk: after the spaces pack/restore, pipe.device can read "cpu" at the
+    # START of the call even though execution happens on a real CUDA GPU inside the
+    # @spaces.GPU fork. Trust the Space environment over the (stale) device property so
+    # the CUDA activation preflight + never-OOM degrade path actually run on ZeroGPU
+    # (otherwise the simple/no-budget path is taken and a heavy request can OOM-SIGKILL).
+    if device_type not in ("mps", "cuda") and models.on_spaces():
+        device_type = "cuda"
+    is_gpu = device_type in ("mps", "cuda")
 
     mode = params["mode"]
     speed = params["speed"]
@@ -95,8 +138,8 @@ def _run(pipe: Any, params: dict[str, Any], progress: Any = None) -> tuple[Image
     seed_in = params["seed"]
     seed = random.randint(0, 2**32 - 1) if seed_in < 0 else int(seed_in)
 
-    # --- CUDA / CPU / mocked path (unchanged behaviour) ---------------------------------
-    if not is_mps:
+    # --- CPU / mocked path (no GPU memory budgeting needed) -----------------------------
+    if not is_gpu:
         _apply_speed(pipe, speed)
         w, h = models.fit_dimensions(images[0])
         gen = torch.Generator(device).manual_seed(seed)
@@ -119,17 +162,21 @@ def _run(pipe: Any, params: dict[str, Any], progress: Any = None) -> tuple[Image
         }
         return out.images[0], meta
 
-    # --- MPS path: serialized, OOM-preflight + reactive degrade-on-OOM -------------------
+    # --- GPU path (MPS or CUDA/ZeroGPU): serialized, OOM-preflight + reactive degrade ----
+    # Same activation-centric never-OOM logic on both: the ~58 GB model is already resident,
+    # so only the activation must fit the free budget (MPS: free unified RAM capped by the
+    # working set; CUDA/ZeroGPU: free VRAM via torch.cuda.mem_get_info). On ZeroGPU xlarge
+    # (96 GB) Edit fits but heavy Compose can exceed -> auto-degrade (the user's mandate).
     import gc
 
     import memory
 
-    with _MPS_LOCK:
+    with _GPU_LOCK:
         gc.collect()
-        torch.mps.empty_cache()
+        _gpu_empty_cache(torch, device_type)
         base_w, base_h = images[0].size
         n_ref0 = max(0, len(images) - 1)
-        plan = memory.plan_request(device, mode, base_w, base_h, n_ref0, speed, steps, true_cfg)
+        plan = memory.plan_request(device_type, mode, base_w, base_h, n_ref0, speed, steps, true_cfg)
         if plan["refused"]:
             raise RuntimeError(plan["note"])
 
@@ -142,8 +189,10 @@ def _run(pipe: Any, params: dict[str, Any], progress: Any = None) -> tuple[Image
         for _attempt in range(8):  # bounded reactive degrade — hard never-OOM guarantee
             imgs = images[: n_ref + 1]
             _apply_speed(pipe, speed)
-            gen = torch.Generator("cpu").manual_seed(seed)  # MPS generator is flaky
-            peak0 = torch.mps.driver_allocated_memory()
+            gen = torch.Generator("cpu").manual_seed(seed)  # CPU generator is safe on MPS + CUDA
+            baseline_gb = _gpu_allocated_gb(torch, device_type)
+            if device_type == "cuda":
+                torch.cuda.reset_peak_memory_stats()
             if progress is not None:
                 progress(0.0, desc="Encoding inputs…")
             try:
@@ -160,29 +209,28 @@ def _run(pipe: Any, params: dict[str, Any], progress: Any = None) -> tuple[Image
                 )
                 break
             except RuntimeError as e:
-                if not _is_mps_oom(e):
+                if not _is_gpu_oom(e):
                     raise
                 last_err = e
                 del gen
                 gc.collect()
-                torch.mps.synchronize()
-                torch.mps.empty_cache()
+                _gpu_synchronize(torch, device_type)
+                _gpu_empty_cache(torch, device_type)
                 # Self-correct AFTER cleanup: at the OOM instant the heap is at its sticky
-                # peak, so activation_budget_gb would read used≈peak -> budget≈0 -> no-op
-                # penalty. With a clean heap it returns the real budget the config overflowed,
-                # so the next identical request degrades preemptively instead of re-OOMing.
-                memory.penalize(h, w, n_ref, true_cfg > 1.0, memory.activation_budget_gb(device))
+                # peak, so the budget would read ~0 -> no-op penalty. A clean heap returns the
+                # real budget the config overflowed, so the next request degrades preemptively.
+                memory.penalize(device_type, h, w, n_ref, true_cfg > 1.0, memory.activation_budget_gb(device_type))
                 nxt = memory.step_down(w, h, n_ref, speed, true_cfg, steps, base_w, base_h, mode)
                 if nxt is None:
-                    raise RuntimeError(f"MPS OOM at the smallest config and cannot degrade further: {e}") from e
+                    raise RuntimeError(f"GPU OOM at the smallest config and cannot degrade further: {e}") from e
                 w, h, n_ref = nxt["width"], nxt["height"], nxt["n_ref"]
                 speed, true_cfg, steps = nxt["speed"], nxt["true_cfg"], nxt["steps"]
                 degrades.append(f"OOM-retry->{w}x{h} {speed} {n_ref + 1}img")
         if out is None:  # pragma: no cover - defensive
-            raise RuntimeError(f"MPS inference failed after retries: {last_err}")
+            raise RuntimeError(f"GPU inference failed after retries: {last_err}")
 
-        peak_gb = max(0.0, (torch.mps.driver_allocated_memory() - peak0) / (1024**3))
-        memory.record_peak(mode, h, w, n_ref, true_cfg > 1.0, peak_gb)
+        peak_gb = _gpu_peak_gb(torch, device_type, baseline_gb)
+        memory.record_peak(device_type, mode, h, w, n_ref, true_cfg > 1.0, peak_gb)
 
         meta = {
             "mode": mode, "speed": speed, "steps": steps, "true_cfg": true_cfg,
@@ -194,7 +242,7 @@ def _run(pipe: Any, params: dict[str, Any], progress: Any = None) -> tuple[Image
             meta["degrades"] = degrades
 
         gc.collect()
-        torch.mps.empty_cache()
+        _gpu_empty_cache(torch, device_type)
         return out.images[0], meta
 
 

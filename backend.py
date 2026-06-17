@@ -54,35 +54,13 @@ def _duration_arg(*args: Any, **kwargs: Any) -> int:
     return duration_for("", params)
 
 
-_GPU = spaces.GPU(duration=_duration_arg) if (spaces is not None and _ON_SPACES) else _identity
-
-
-def _upcast_vae_for_mps(pipe: Any, torch: Any) -> None:
-    """Opt-in fp32 VAE for MPS that still accepts the pipeline's bf16 tensors.
-
-    The QwenImageEditPlus pipeline calls ``vae.encode``/``vae.decode`` without casting,
-    so a bare fp32 VAE mismatches the bf16 inputs. We move the VAE to fp32 and wrap its
-    encode/decode to upcast inputs and downcast the decoded sample back to the pipeline
-    dtype — keeping the rest of the pipeline in bf16. Only used when QIE_MPS_VAE_FP32=1
-    (i.e. if a bf16 VAE is ever found to produce black/NaN images on this hardware).
-    """
-    vae = pipe.vae
-    pipe_dtype = getattr(pipe, "dtype", torch.bfloat16)
-    vae.to(torch.float32)
-    if getattr(vae, "config", None) is not None:
-        vae.config.force_upcast = True
-    _orig_encode, _orig_decode = vae.encode, vae.decode
-
-    def _encode(x, *a, **k):
-        return _orig_encode(x.to(torch.float32), *a, **k)
-
-    def _decode(z, *a, **k):
-        out = _orig_decode(z.to(torch.float32), *a, **k)
-        if hasattr(out, "sample"):
-            out.sample = out.sample.to(pipe_dtype)
-        return out
-
-    vae.encode, vae.decode = _encode, _decode
+# ZeroGPU GPU size: "xlarge" (96 GB, full RTX Pro 6000 Blackwell, 2x quota) is required
+# because the ~58 GB bf16 model does NOT fit the default "large" (48 GB) tier. xlarge keeps
+# the whole model resident with NO cpu_offload, eliminating the slow per-call materialization
+# that exceeded the proxy-TTL on the 48 GB tier (the historical "image produced but never
+# delivered" failure). Override via QIE_GPU_SIZE.
+_GPU_SIZE = os.environ.get("QIE_GPU_SIZE", "xlarge")
+_GPU = spaces.GPU(duration=_duration_arg, size=_GPU_SIZE) if (spaces is not None and _ON_SPACES) else _identity
 
 
 def _build_pipeline() -> Any:
@@ -104,7 +82,11 @@ def _build_pipeline() -> Any:
 
     import models
 
-    device = models.auto_device()
+    # On ZeroGPU the build runs under CPU-emulation where auto_device() can misreport
+    # (cuda.is_available() may be False at module scope), yet the real per-call device is
+    # CUDA. Trust the Space env so the dtype/VAE/placement decisions below are consistent
+    # with how the model actually runs. Off-Spaces, autodetect (cuda > mps > cpu).
+    device = "cuda" if models.on_spaces() else models.auto_device()
 
     # LOAD gate (MPS): confirm the ~58 GB resident weights fit BEFORE materializing
     # shards, so a low-memory box refuses cleanly instead of OOM / swap-thrashing
@@ -120,15 +102,13 @@ def _build_pipeline() -> Any:
                 f"Free ~{need - budget:.0f} GB then retry. Top consumers: {memory.top_consumers()}"
             )
 
-    # fp8 weight-only quantization is a CUDA-only path (torchao). It is used ONLY on
-    # CUDA (local GPU or ZeroGPU), where shrinking the transformer ~40 GB bf16 -> ~20 GB
-    # fp8 matters to fit the `large` (48 GB) tier and ~halve the per-call materialization
-    # so the ZeroGPU call completes inside the proxy-token TTL. On Apple Silicon (MPS) or
-    # CPU there is no torchao fp8 kernel, so we load the model full-precision bf16: this
-    # machine's 128 GB unified memory holds the ~58 GB bf16 model comfortably (transformer
-    # 40.9 GB + text_encoder 16.6 GB + vae 0.25 GB). The fp8 import is deferred into this
-    # branch so MPS/CPU runs never require torchao to be installed.
-    use_fp8 = device == "cuda"
+    # Precision: default to full bf16 everywhere (the ~58 GB model — transformer 40.9 +
+    # text_encoder 16.6 + vae 0.25 — fits the MPS 128 GB unified pool AND the ZeroGPU
+    # `xlarge` 96 GB tier with the whole model resident, no offload). fp8 weight-only
+    # quantization (torchao, CUDA-only) is now OPT-IN via QIE_USE_FP8=1: it shrinks the
+    # transformer ~40->~20 GB to fit the smaller `large` 48 GB tier, but the torchao/
+    # diffusers fp8 stack proved unstable, so bf16 on xlarge is the default/working path.
+    use_fp8 = device == "cuda" and os.environ.get("QIE_USE_FP8", "0") == "1"
 
     if use_fp8:
         from diffusers import TorchAoConfig
@@ -140,19 +120,21 @@ def _build_pipeline() -> Any:
             quantization_config=TorchAoConfig(Float8WeightOnlyConfig()),
             torch_dtype=torch.bfloat16,
         )
-    else:
-        # MPS / CPU: full bf16, no quantization (torchao fp8 is CUDA-only).
-        transformer = QwenImageTransformer2DModel.from_pretrained(
+        pipe = QwenImageEditPlusPipeline.from_pretrained(
             models.MODEL_ID,
-            subfolder="transformer",
+            transformer=transformer,
             torch_dtype=torch.bfloat16,
         )
-
-    pipe = QwenImageEditPlusPipeline.from_pretrained(
-        models.MODEL_ID,
-        transformer=transformer,
-        torch_dtype=torch.bfloat16,
-    )
+    else:
+        # Default bf16: load the WHOLE pipeline directly (no separately-loaded transformer).
+        # On ZeroGPU a separately-constructed component is a suspected disruptor of the
+        # snapshot/restore CUDA placement (observed: all components landed on CPU in the
+        # fork). Direct load mirrors the official Qwen Space and lets `spaces` track every
+        # component for the cuda snapshot.
+        pipe = QwenImageEditPlusPipeline.from_pretrained(
+            models.MODEL_ID,
+            torch_dtype=torch.bfloat16,
+        )
 
     # Stash the bundled default scheduler for Quality mode.
     pipe._qie_default_scheduler = pipe.scheduler
@@ -172,22 +154,21 @@ def _build_pipeline() -> Any:
     # physical RAM (CPU+GPU share one 128 GB pool), so MPS goes straight to .to(mps)
     # (models.should_cpu_offload already returns False for mps).
     if models.on_spaces():
-        pipe.to("cuda")
+        # ZeroGPU: leave the model on CPU at module level and move it to cuda INSIDE the
+        # @spaces.GPU fork (generate()). A module-level pipe.to("cuda") is snapshotted, and on
+        # per-call restore the params land back on CPU while a ~36 GB orphaned cuda copy stays
+        # resident → the in-fork .to then makes a 2nd copy → ~94 GB duplication (no room for
+        # activation). Building on CPU = no cuda orphan → one clean ~58 GB copy in the fork.
+        pass
     elif models.should_cpu_offload(device):
         pipe.enable_model_cpu_offload()
     else:
         pipe.to(device)
 
-    # MPS-specific setup, applied AFTER .to("mps"):
+    # VAE tiling + slicing cap the decode memory spike — enabled on MPS (unified memory is
+    # tight). Not needed on CUDA/ZeroGPU: the 96 GB xlarge tier decodes 1024^2 untiled with
+    # ample headroom (measured activation peak ~4 GB).
     if device == "mps":
-        # VAE dtype: keep bf16 to match the pipeline. The QwenImageEditPlus pipeline
-        # calls vae.encode(image) on a bf16-preprocessed image WITHOUT upcasting, so
-        # forcing the VAE to fp32 breaks encode ("Input bf16 vs bias float"). If a bf16
-        # VAE decode ever yields black/NaN images on MPS, set QIE_MPS_VAE_FP32=1 to opt
-        # into the fp32 VAE + input-upcast path (_upcast_vae_for_mps).
-        if os.environ.get("QIE_MPS_VAE_FP32", "0") == "1":
-            _upcast_vae_for_mps(pipe, torch)
-        # VAE tiling + slicing cap the decode memory spike (nearly free).
         for _fn in ("enable_vae_tiling", "enable_vae_slicing"):
             if hasattr(pipe, _fn):
                 getattr(pipe, _fn)()
@@ -213,6 +194,14 @@ class QwenImageEditBackend:
         rather than an opaque AttributeError / KeyError. ``progress`` (optional
         gr.Progress) is forwarded to the handler to drive a clean step bar.
         """
+        # ZeroGPU placement: the model is built on CPU (a module-level .to("cuda") gets
+        # snapshotted and restores the params back to CPU while leaving a duplicate cuda copy
+        # resident). Moving to cuda HERE — inside the @spaces.GPU fork, where a real GPU is
+        # attached — gives one clean ~55 GB resident copy with ~37 GB free for activation.
+        # Idempotent; Spaces-only (local MPS/CPU placement is set at build time).
+        if _ON_SPACES:
+            self.pipeline.to("cuda")
+
         handler = modes.DISPATCH.get(mode)
         if handler is None:
             raise ValueError(f"unknown mode: {mode!r}; expected one of {list(modes.DISPATCH)}")
