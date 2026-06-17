@@ -64,7 +64,7 @@ def on_edit_generate(
     true_cfg,
     negative_prompt,
     seed,
-    progress=gr.Progress(track_tqdm=True),  # noqa: B008
+    progress=gr.Progress(),  # noqa: B008 — manual step progress (see modes._step_callback)
 ):
     params = dict(
         mode="edit",
@@ -76,7 +76,7 @@ def on_edit_generate(
         negative_prompt=negative_prompt or " ",
         seed=int(seed),
     )
-    return backend.generate_with_retry(_get_backend(), "edit", params)
+    return backend.generate_with_retry(_get_backend(), "edit", params, progress)
 
 
 def on_compose_generate(
@@ -89,7 +89,7 @@ def on_compose_generate(
     true_cfg,
     negative_prompt,
     seed,
-    progress=gr.Progress(track_tqdm=True),  # noqa: B008
+    progress=gr.Progress(),  # noqa: B008 — manual step progress (see modes._step_callback)
 ):
     images = [i for i in (target, ref1, ref2) if i is not None]
     params = dict(
@@ -102,7 +102,7 @@ def on_compose_generate(
         negative_prompt=negative_prompt or " ",
         seed=int(seed),
     )
-    return backend.generate_with_retry(_get_backend(), "compose", params)
+    return backend.generate_with_retry(_get_backend(), "compose", params, progress)
 
 
 # ----- HTML blocks -----------------------------------------------------------

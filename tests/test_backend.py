@@ -89,7 +89,7 @@ def test_duration_for_returns_int():
 
 
 def test_generate_routes_to_dispatch(monkeypatch, fake_backend):
-    """generate must call modes.DISPATCH[mode] with (pipeline, params)."""
+    """generate must call modes.DISPATCH[mode] with (pipeline, params, progress)."""
     sentinel = ("output_image", {"meta": True})
     fake_handler = MagicMock(return_value=sentinel)
     monkeypatch.setattr(modes, "DISPATCH", {"edit": fake_handler})
@@ -97,7 +97,8 @@ def test_generate_routes_to_dispatch(monkeypatch, fake_backend):
     params = {"speed": "Fast", "prompt": "test"}
     result = fake_backend.generate("edit", params)
 
-    fake_handler.assert_called_once_with(fake_backend.pipeline, params)
+    # progress defaults to None when not supplied (e.g. non-UI callers / CI).
+    fake_handler.assert_called_once_with(fake_backend.pipeline, params, None)
     assert result is sentinel
 
 

@@ -206,30 +206,32 @@ class QwenImageEditBackend:
         self.pipeline = _build_pipeline()
 
     @_GPU
-    def generate(self, mode: str, params: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
+    def generate(self, mode: str, params: dict[str, Any], progress: Any = None) -> tuple[Any, dict[str, Any]]:
         """Route the request to the appropriate mode handler.
 
         Raises ValueError for unrecognised modes so callers get a clear error
-        rather than an opaque AttributeError / KeyError.
+        rather than an opaque AttributeError / KeyError. ``progress`` (optional
+        gr.Progress) is forwarded to the handler to drive a clean step bar.
         """
         handler = modes.DISPATCH.get(mode)
         if handler is None:
             raise ValueError(f"unknown mode: {mode!r}; expected one of {list(modes.DISPATCH)}")
-        return handler(self.pipeline, params)
+        return handler(self.pipeline, params, progress)
 
 
 def generate_with_retry(
     backend_instance: QwenImageEditBackend,
     mode: str,
     params: dict[str, Any],
+    progress: Any = None,
 ) -> tuple[Any, dict[str, Any]]:
     """Call backend_instance.generate; on ZeroGPU GPU-task-abort, retry exactly once.
 
     Any other exception propagates immediately without a retry.
     """
     try:
-        return backend_instance.generate(mode, params)
+        return backend_instance.generate(mode, params, progress)
     except Exception as e:
         if "gpu task aborted" in str(e).lower():
-            return backend_instance.generate(mode, params)
+            return backend_instance.generate(mode, params, progress)
         raise

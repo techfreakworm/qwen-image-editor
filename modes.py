@@ -46,7 +46,26 @@ def _apply_speed(pipe: Any, speed: str) -> None:
         pipe.disable_lora()
 
 
-def _run(pipe: Any, params: dict[str, Any]) -> tuple[Image.Image, dict[str, Any]]:
+def _step_callback(progress: Any, total_steps: int) -> Any:
+    """Build a diffusers ``callback_on_step_end`` that drives a ``gr.Progress`` with clear
+    labels ("Generating — step N/M"). Returns None when there's no progress object (CI /
+    non-UI calls), so the pipeline call is unchanged off the UI path.
+
+    Using an explicit step callback (instead of Gradio's ``track_tqdm``) avoids the
+    confusing "Downloading (incomplete total…) 0/0 B" placeholder Gradio renders for the
+    pipeline's internal, total-less tqdm bars during the input-encode phase.
+    """
+    if progress is None:
+        return None
+
+    def _cb(_pipe: Any, step: int, _timestep: Any, callback_kwargs: dict) -> dict:
+        progress((step + 1) / max(1, total_steps), desc=f"Generating — step {step + 1}/{total_steps}")
+        return callback_kwargs
+
+    return _cb
+
+
+def _run(pipe: Any, params: dict[str, Any], progress: Any = None) -> tuple[Image.Image, dict[str, Any]]:
     """Run inference and return (output_image, metadata).
 
     Validates that at least one image is present, applies the speed mode, resolves
@@ -54,7 +73,7 @@ def _run(pipe: Any, params: dict[str, Any]) -> tuple[Image.Image, dict[str, Any]
     it sizes the request against a live memory budget and auto-degrades down a ladder
     (resolution -> refs -> drop CFG double-pass -> Quality->Fast) so inference never
     OOMs; the math + any degradation are surfaced in meta. The CUDA/CPU path is
-    unchanged.
+    unchanged. ``progress`` (optional gr.Progress) drives a clean step bar.
     """
     images: list[Any] = params["images"]
     if not images:
@@ -81,6 +100,8 @@ def _run(pipe: Any, params: dict[str, Any]) -> tuple[Image.Image, dict[str, Any]
         _apply_speed(pipe, speed)
         w, h = models.fit_dimensions(images[0])
         gen = torch.Generator(device).manual_seed(seed)
+        if progress is not None:
+            progress(0.0, desc="Encoding inputs…")
         out = pipe(
             image=images,
             prompt=prompt,
@@ -90,6 +111,7 @@ def _run(pipe: Any, params: dict[str, Any]) -> tuple[Image.Image, dict[str, Any]
             height=h,
             width=w,
             generator=gen,
+            callback_on_step_end=_step_callback(progress, steps),
         )
         meta = {
             "mode": mode, "speed": speed, "steps": steps, "true_cfg": true_cfg,
@@ -122,6 +144,8 @@ def _run(pipe: Any, params: dict[str, Any]) -> tuple[Image.Image, dict[str, Any]
             _apply_speed(pipe, speed)
             gen = torch.Generator("cpu").manual_seed(seed)  # MPS generator is flaky
             peak0 = torch.mps.driver_allocated_memory()
+            if progress is not None:
+                progress(0.0, desc="Encoding inputs…")
             try:
                 out = pipe(
                     image=imgs,
@@ -132,6 +156,7 @@ def _run(pipe: Any, params: dict[str, Any]) -> tuple[Image.Image, dict[str, Any]
                     height=h,
                     width=w,
                     generator=gen,
+                    callback_on_step_end=_step_callback(progress, steps),
                 )
                 break
             except RuntimeError as e:
@@ -173,17 +198,17 @@ def _run(pipe: Any, params: dict[str, Any]) -> tuple[Image.Image, dict[str, Any]
         return out.images[0], meta
 
 
-def call_edit(pipe: Any, params: dict[str, Any]) -> tuple[Image.Image, dict[str, Any]]:
+def call_edit(pipe: Any, params: dict[str, Any], progress: Any = None) -> tuple[Image.Image, dict[str, Any]]:
     """Edit mode: single input image + instruction -> edited image.
 
     Expects params["images"] == [target_image].
     """
     p = dict(params)
     p["mode"] = "edit"
-    return _run(pipe, p)
+    return _run(pipe, p, progress)
 
 
-def call_compose(pipe: Any, params: dict[str, Any]) -> tuple[Image.Image, dict[str, Any]]:
+def call_compose(pipe: Any, params: dict[str, Any], progress: Any = None) -> tuple[Image.Image, dict[str, Any]]:
     """Compose mode: target image + up to 2 optional reference images -> composed edit.
 
     None slots in params["images"] are dropped before the pipeline call so the
@@ -192,7 +217,7 @@ def call_compose(pipe: Any, params: dict[str, Any]) -> tuple[Image.Image, dict[s
     p = dict(params)
     p["mode"] = "compose"
     p["images"] = [img for img in params["images"] if img is not None]
-    return _run(pipe, p)
+    return _run(pipe, p, progress)
 
 
 DISPATCH: dict[str, Any] = {
