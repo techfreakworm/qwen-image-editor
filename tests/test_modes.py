@@ -151,6 +151,21 @@ def test_fast_speed_uses_lightning_scheduler(fake_pipe: MagicMock) -> None:
     assert fake_pipe.scheduler is fake_pipe._qie_lightning_scheduler
 
 
+def _call_order(pipe: MagicMock, *names: str) -> list[str]:
+    """Ordered list of the named methods as actually invoked on the pipe (for sequencing)."""
+    return [c[0] for c in pipe.mock_calls if c[0] in names]
+
+
+def test_fast_speed_enables_lora_before_set_adapters(fake_pipe: MagicMock) -> None:
+    """Regression: set_adapters() only flips the active adapter NAME — it does NOT re-enable
+    layers a prior Quality disable_lora() turned off. Fast must call enable_lora() FIRST or
+    Lightning is silently bypassed on the long-lived MPS process (each request reuses one pipe)."""
+    modes.call_edit(fake_pipe, _make_params(speed="Fast", steps=4, true_cfg=1.0))
+
+    order = _call_order(fake_pipe, "enable_lora", "set_adapters")
+    assert order[: 2] == ["enable_lora", "set_adapters"], f"enable_lora must precede set_adapters; got {order}"
+
+
 def test_quality_speed_calls_disable_lora(fake_pipe: MagicMock) -> None:
     """Quality speed must call pipe.disable_lora() to deactivate the Lightning adapter."""
     modes.call_edit(fake_pipe, _make_params(speed="Quality", steps=40, true_cfg=4.0))
@@ -172,6 +187,91 @@ def test_quality_speed_uses_default_scheduler(fake_pipe: MagicMock) -> None:
     modes.call_edit(fake_pipe, _make_params(speed="Quality"))
 
     assert fake_pipe.scheduler is fake_pipe._qie_default_scheduler
+
+
+# ---------------------------------------------------------------------------
+# GPU-path user LoRA (device="mps" → the budgeted GPU branch, where LoRA applies)
+# ---------------------------------------------------------------------------
+
+
+def _mock_gpu_memory(monkeypatch: pytest.MonkeyPatch, *, speed: str = "Quality") -> None:
+    """Stub memory.* so modes._run's GPU branch runs without real budgeting, and make the
+    torch stub's mps allocator return a real number."""
+    import memory
+
+    plan = {
+        "refused": False, "width": 1024, "height": 1024, "steps": 8, "true_cfg": 4.0,
+        "speed": speed, "n_ref": 0, "degrades": [], "note": "ok", "budget_gb": 90.0, "need_gb": 60.0,
+    }
+    monkeypatch.setattr(memory, "plan_request", lambda *a, **k: dict(plan))
+    monkeypatch.setattr(memory, "record_peak", lambda *a, **k: None)
+    monkeypatch.setattr(memory, "penalize", lambda *a, **k: None)
+    monkeypatch.setattr(memory, "activation_budget_gb", lambda *a, **k: 90.0)
+    sys.modules["torch"].mps.driver_allocated_memory.return_value = 60 * 1024**3
+
+
+def test_gpu_quality_user_lora_loads_sets_and_cleans_up(fake_pipe: MagicMock, monkeypatch) -> None:
+    """Quality + user LoRA on the GPU path: load 'user', activate it, surface it in meta, and
+    ALWAYS delete it afterwards (mandatory MPS cleanup — no per-call re-fork)."""
+    fake_pipe.device = "mps"
+    _mock_gpu_memory(monkeypatch, speed="Quality")
+    p = _make_params(speed="Quality", steps=8, true_cfg=4.0)
+    p["lora_path"] = "/tmp/foo.safetensors"
+    p["lora_weight"] = 0.8
+
+    _, meta = modes.call_edit(fake_pipe, p)
+
+    fake_pipe.load_lora_weights.assert_called_once_with("/tmp/foo.safetensors", adapter_name="user")
+    assert any(c.args == (["user"], [0.8]) for c in fake_pipe.set_adapters.call_args_list)
+    fake_pipe.delete_adapters.assert_any_call("user")  # cleanup ran
+    assert meta.get("lora", {}).get("weight") == 0.8
+    # The activate sequence must be enable_lora() THEN set_adapters(["user"], ...): Quality's
+    # disable_lora() left the layers off, and set_adapters alone wouldn't re-enable them —
+    # without enable_lora() the LoRA loads but has ZERO effect (output identical to no-LoRA).
+    seq = [(c[0], c[1]) for c in fake_pipe.mock_calls if c[0] in ("enable_lora", "set_adapters")]
+    user_idx = next(i for i, (n, a) in enumerate(seq) if n == "set_adapters" and a == (["user"], [0.8]))
+    assert any(n == "enable_lora" for n, _ in seq[:user_idx]), f"enable_lora must precede user set_adapters; got {seq}"
+
+
+def test_gpu_quality_without_lora_touches_no_user_adapter(fake_pipe: MagicMock, monkeypatch) -> None:
+    """No LoRA requested → never load or delete a 'user' adapter; meta has no 'lora'."""
+    fake_pipe.device = "mps"
+    _mock_gpu_memory(monkeypatch, speed="Quality")
+
+    _, meta = modes.call_edit(fake_pipe, _make_params(speed="Quality", steps=8, true_cfg=4.0))
+
+    fake_pipe.load_lora_weights.assert_not_called()
+    fake_pipe.delete_adapters.assert_not_called()
+    assert "lora" not in meta
+
+
+def test_gpu_fast_ignores_user_lora(fake_pipe: MagicMock, monkeypatch) -> None:
+    """A user LoRA is Quality-only — in Fast it must NOT be loaded or applied."""
+    fake_pipe.device = "mps"
+    _mock_gpu_memory(monkeypatch, speed="Fast")
+    p = _make_params(speed="Fast", steps=4, true_cfg=1.0)
+    p["lora_path"] = "/tmp/foo.safetensors"
+    p["lora_weight"] = 0.9
+
+    _, meta = modes.call_edit(fake_pipe, p)
+
+    fake_pipe.load_lora_weights.assert_not_called()
+    assert "lora" not in meta
+
+
+def test_gpu_user_lora_cleaned_up_on_error(fake_pipe: MagicMock, monkeypatch) -> None:
+    """If inference raises (non-OOM), the 'user' adapter must STILL be deleted (finally)."""
+    fake_pipe.device = "mps"
+    _mock_gpu_memory(monkeypatch, speed="Quality")
+    fake_pipe.side_effect = ValueError("boom")  # pipe(...) raises
+    p = _make_params(speed="Quality", steps=8, true_cfg=4.0)
+    p["lora_path"] = "/tmp/foo.safetensors"
+    p["lora_weight"] = 0.8
+
+    with pytest.raises(ValueError, match="boom"):
+        modes.call_edit(fake_pipe, p)
+
+    fake_pipe.delete_adapters.assert_any_call("user")  # leak-proof cleanup
 
 
 # ---------------------------------------------------------------------------

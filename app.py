@@ -22,6 +22,7 @@ os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "1.0")
 import gradio as gr
 
 import backend
+import lora
 import models
 import theme
 import tooltips  # noqa: F401 — imported for public API availability
@@ -56,6 +57,18 @@ def _speed_defaults(speed: str) -> tuple:
 # ----- Generation event handlers ---------------------------------------------
 
 
+def _resolve_user_lora(lora_repo, lora_file, lora_weight) -> dict:
+    """Resolve the user LoRA (CPU, off the GPU clock) into params keys, or raise a friendly
+    gr.Error. Returns {} when no LoRA is requested."""
+    try:
+        path = lora.resolve_lora(lora_repo, lora_file)
+    except lora.LoraError as e:
+        raise gr.Error(str(e)) from e
+    if path is None:
+        return {}
+    return {"lora_path": path, "lora_weight": float(lora_weight)}
+
+
 def on_edit_generate(
     image,
     prompt,
@@ -64,6 +77,9 @@ def on_edit_generate(
     true_cfg,
     negative_prompt,
     seed,
+    lora_repo,
+    lora_file,
+    lora_weight,
     progress=gr.Progress(),  # noqa: B008 — manual step progress (see modes._step_callback)
 ):
     params = dict(
@@ -75,6 +91,7 @@ def on_edit_generate(
         true_cfg=float(true_cfg),
         negative_prompt=negative_prompt or " ",
         seed=int(seed),
+        **_resolve_user_lora(lora_repo, lora_file, lora_weight),
     )
     return backend.generate_with_retry(_get_backend(), "edit", params, progress)
 
@@ -89,6 +106,9 @@ def on_compose_generate(
     true_cfg,
     negative_prompt,
     seed,
+    lora_repo,
+    lora_file,
+    lora_weight,
     progress=gr.Progress(),  # noqa: B008 — manual step progress (see modes._step_callback)
 ):
     images = [i for i in (target, ref1, ref2) if i is not None]
@@ -101,6 +121,7 @@ def on_compose_generate(
         true_cfg=float(true_cfg),
         negative_prompt=negative_prompt or " ",
         seed=int(seed),
+        **_resolve_user_lora(lora_repo, lora_file, lora_weight),
     )
     return backend.generate_with_retry(_get_backend(), "compose", params, progress)
 
@@ -167,6 +188,9 @@ def build_app() -> gr.Blocks:
                         e["true_cfg"],
                         e["negative_prompt"],
                         e["seed"],
+                        e["lora_repo"],
+                        e["lora_file"],
+                        e["lora_weight"],
                     ],
                     outputs=[e["output_image"], e["output_meta"]],
                 )
@@ -190,6 +214,9 @@ def build_app() -> gr.Blocks:
                         c["true_cfg"],
                         c["negative_prompt"],
                         c["seed"],
+                        c["lora_repo"],
+                        c["lora_file"],
+                        c["lora_weight"],
                     ],
                     outputs=[c["output_image"], c["output_meta"]],
                 )

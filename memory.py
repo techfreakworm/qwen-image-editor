@@ -148,7 +148,9 @@ def activation_gb(height: int, width: int, n_ref: int, cfg_on: bool, device: str
     return base + per_img * n_img + denoise * (n_img + 1) * mp_out * cfg_fac
 
 
-def _act_estimate(device: str, height: int, width: int, n_ref: int, cfg_on: bool) -> float:
+def _act_estimate(
+    device: str, height: int, width: int, n_ref: int, cfg_on: bool, has_user_lora: bool = False
+) -> float:
     """Activation-only estimate (GB), device-aware.
 
     The formula is already re-fit to measured reality (+margin), so a calibrated value
@@ -159,7 +161,7 @@ def _act_estimate(device: str, height: int, width: int, n_ref: int, cfg_on: bool
     only RAISE the estimate above the formula, never lower it. record_peak still ratchets
     up for genuinely-higher fragmented peaks.
     """
-    key = (device, "act", _res_bucket(height, width), n_ref, cfg_on)
+    key = (device, "act", _res_bucket(height, width), n_ref, cfg_on, has_user_lora)
     formula = activation_gb(height, width, n_ref, cfg_on, device)
     calib = _CALIB.get(key)
     if calib is None:
@@ -213,7 +215,8 @@ def activation_budget_gb(device: str) -> float:
 
 
 def record_peak(
-    device: str, mode: str, height: int, width: int, n_ref: int, cfg_on: bool, measured_peak_gb: float
+    device: str, mode: str, height: int, width: int, n_ref: int, cfg_on: bool, measured_peak_gb: float,
+    has_user_lora: bool = False,
 ) -> None:
     """Record a measured activation peak for calibration (FIX #2: floor-guarded).
 
@@ -226,7 +229,7 @@ def record_peak(
     floor = _ACT_BASE  # any real inference allocates at least the base overhead
     if measured_peak_gb < floor:
         return
-    key = (device, "act", _res_bucket(height, width), n_ref, cfg_on)
+    key = (device, "act", _res_bucket(height, width), n_ref, cfg_on, has_user_lora)
     _CALIB[key] = max(_CALIB.get(key, 0.0), measured_peak_gb * _CALIB_MARGIN)
 
 
@@ -266,6 +269,7 @@ def plan_request(
     speed: str,
     steps: int,
     true_cfg: float,
+    has_user_lora: bool = False,
 ) -> dict:
     """Walk the degrade ladder; return the least-degraded plan that fits BUDGET.
 
@@ -298,7 +302,7 @@ def plan_request(
 
     for mp, nref_c, cfg_c, speed_c in candidates():
         w, h = fit_dims(base_w, base_h, mp)
-        act = _act_estimate(device, w, h, nref_c, cfg_c > 1.0)
+        act = _act_estimate(device, w, h, nref_c, cfg_c > 1.0, has_user_lora)
         if act <= act_budget:
             degrades = []
             if nref_c < n_ref:
@@ -321,7 +325,7 @@ def plan_request(
 
     # Hard floor: even the bottom rung's activation overflows free memory.
     w, h = fit_dims(base_w, base_h, RES_RUNGS[-1])
-    act = _act_estimate(device, w, h, min_ref, False)
+    act = _act_estimate(device, w, h, min_ref, False, has_user_lora)
     footprint = RESIDENT_GB + LORA_GB + act
     note = (
         f"OOM-REFUSED: even {w}x{h} Fast needs ~{act:.0f} GB activation > free {act_budget:.0f} GB "
@@ -347,14 +351,17 @@ def _note(act, act_budget, footprint, w, h, n_ref, quality, degrades) -> str:
     return base + " No degrade."
 
 
-def penalize(device: str, height: int, width: int, n_ref: int, cfg_on: bool, failed_budget_gb: float) -> None:
+def penalize(
+    device: str, height: int, width: int, n_ref: int, cfg_on: bool, failed_budget_gb: float,
+    has_user_lora: bool = False,
+) -> None:
     """Self-correcting calibration after an ACTUAL OOM (qwen-brain Q2.2).
 
     Bumps this config's cached estimate above the budget it just overflowed, so the next
     identical request degrades preemptively in the preflight instead of repeating the
     OOM + retry loop. Device-keyed (per record_peak).
     """
-    key = (device, "act", _res_bucket(height, width), n_ref, cfg_on)
+    key = (device, "act", _res_bucket(height, width), n_ref, cfg_on, has_user_lora)
     _CALIB[key] = max(_CALIB.get(key, 0.0), failed_budget_gb * 1.2)
 
 

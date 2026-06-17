@@ -75,10 +75,30 @@ def _apply_speed(pipe: Any, speed: str) -> None:
     """
     if speed == "Fast":
         pipe.scheduler = pipe._qie_lightning_scheduler
+        # enable_lora() FIRST: a prior Quality run's disable_lora() leaves every adapter
+        # layer with _disable_adapters=True, and set_adapters() only flips the *active*
+        # adapter name — it does NOT re-enable the layers. Without this, Lightning is
+        # silently bypassed on the long-lived MPS process (ZeroGPU hides it: each call
+        # re-forks a fresh pipeline). enable_lora() is a harmless no-op when already enabled.
+        pipe.enable_lora()
         pipe.set_adapters([models.LORA_ADAPTER_NAME], [1.0])
     else:
         pipe.scheduler = pipe._qie_default_scheduler
         pipe.disable_lora()
+
+
+_USER_LORA_ADAPTER = "user"
+
+
+def _delete_user_lora(pipe: Any) -> None:
+    """Remove the user LoRA adapter (best-effort). MANDATORY on MPS: it's a single
+    long-lived process with NO per-call re-fork, so a leftover adapter would silently leak
+    into the next request. (On ZeroGPU the fork re-forks clean, but cleanup is harmless.)
+    """
+    try:
+        pipe.delete_adapters(_USER_LORA_ADAPTER)
+    except Exception:
+        pass
 
 
 def _step_callback(progress: Any, total_steps: int) -> Any:
@@ -176,7 +196,16 @@ def _run(pipe: Any, params: dict[str, Any], progress: Any = None) -> tuple[Image
         _gpu_empty_cache(torch, device_type)
         base_w, base_h = images[0].size
         n_ref0 = max(0, len(images) - 1)
-        plan = memory.plan_request(device_type, mode, base_w, base_h, n_ref0, speed, steps, true_cfg)
+        # User LoRA (Quality-only): a local .safetensors path resolved by the handler (off the
+        # GPU clock). Ignored in Fast — the Lightning 4-step distillation fights a content LoRA.
+        lora_path = params.get("lora_path")
+        _lw = params.get("lora_weight")
+        lora_weight = 0.9 if _lw is None else float(_lw)  # explicit None check keeps a valid 0.0
+        lora_requested = bool(lora_path) and speed == "Quality"
+
+        plan = memory.plan_request(
+            device_type, mode, base_w, base_h, n_ref0, speed, steps, true_cfg, lora_requested
+        )
         if plan["refused"]:
             raise RuntimeError(plan["note"])
 
@@ -184,66 +213,105 @@ def _run(pipe: Any, params: dict[str, Any], progress: Any = None) -> tuple[Image
         steps, true_cfg, speed, n_ref = plan["steps"], plan["true_cfg"], plan["speed"], plan["n_ref"]
         degrades = list(plan["degrades"])
 
+        # The user LoRA applies only if the FINAL (post-degrade) speed is Quality — if the
+        # preflight degraded Quality->Fast, drop it (else record_peak/penalize would mis-key
+        # the Fast peak into the has_user_lora cache slot). Recomputed AFTER the plan.
+        lora_active = bool(lora_path) and speed == "Quality"
+
         out = None
         last_err: Exception | None = None
-        for _attempt in range(8):  # bounded reactive degrade — hard never-OOM guarantee
-            imgs = images[: n_ref + 1]
-            _apply_speed(pipe, speed)
-            gen = torch.Generator("cpu").manual_seed(seed)  # CPU generator is safe on MPS + CUDA
-            baseline_gb = _gpu_allocated_gb(torch, device_type)
-            if device_type == "cuda":
-                torch.cuda.reset_peak_memory_stats()
-            if progress is not None:
-                progress(0.0, desc="Encoding inputs…")
-            try:
-                out = pipe(
-                    image=imgs,
-                    prompt=prompt,
-                    negative_prompt=negative_prompt,
-                    true_cfg_scale=true_cfg,
-                    num_inference_steps=steps,
-                    height=h,
-                    width=w,
-                    generator=gen,
-                    callback_on_step_end=_step_callback(progress, steps),
-                )
-                break
-            except RuntimeError as e:
-                if not _is_gpu_oom(e):
-                    raise
-                last_err = e
-                del gen
-                gc.collect()
-                _gpu_synchronize(torch, device_type)
-                _gpu_empty_cache(torch, device_type)
-                # Self-correct AFTER cleanup: at the OOM instant the heap is at its sticky
-                # peak, so the budget would read ~0 -> no-op penalty. A clean heap returns the
-                # real budget the config overflowed, so the next request degrades preemptively.
-                memory.penalize(device_type, h, w, n_ref, true_cfg > 1.0, memory.activation_budget_gb(device_type))
-                nxt = memory.step_down(w, h, n_ref, speed, true_cfg, steps, base_w, base_h, mode)
-                if nxt is None:
-                    raise RuntimeError(f"GPU OOM at the smallest config and cannot degrade further: {e}") from e
-                w, h, n_ref = nxt["width"], nxt["height"], nxt["n_ref"]
-                speed, true_cfg, steps = nxt["speed"], nxt["true_cfg"], nxt["steps"]
-                degrades.append(f"OOM-retry->{w}x{h} {speed} {n_ref + 1}img")
-        if out is None:  # pragma: no cover - defensive
-            raise RuntimeError(f"GPU inference failed after retries: {last_err}")
+        # Tracks whether the "user" adapter actually got loaded — drives the finally cleanup
+        # INDEPENDENTLY of lora_active (which can flip False mid-loop on an OOM degrade to Fast).
+        # If cleanup keyed off lora_active, a Quality->Fast degrade would leak the loaded adapter.
+        user_lora_loaded = False
+        try:
+            # Load the user LoRA once (adapter "user"), INSIDE the try so the finally below
+            # always cleans it up — even if load_lora_weights raises (no adapter leak on the
+            # long-lived MPS process). Re-activated per attempt AFTER _apply_speed (Quality's
+            # disable_lora() turns all adapters off). delete-before-load clears a stale one.
+            if lora_active:
+                _delete_user_lora(pipe)
+                pipe.load_lora_weights(lora_path, adapter_name=_USER_LORA_ADAPTER)
+                user_lora_loaded = True
+            for _attempt in range(8):  # bounded reactive degrade — hard never-OOM guarantee
+                imgs = images[: n_ref + 1]
+                _apply_speed(pipe, speed)
+                if lora_active and speed == "Quality":
+                    # _apply_speed's disable_lora() (Quality branch) left every adapter
+                    # layer disabled; re-enable before activating the user adapter, else
+                    # set_adapters() flips the active name but the layers stay bypassed and
+                    # the LoRA has ZERO effect (output identical to no-LoRA). See _apply_speed.
+                    pipe.enable_lora()
+                    pipe.set_adapters([_USER_LORA_ADAPTER], [lora_weight])
+                gen = torch.Generator("cpu").manual_seed(seed)  # CPU generator is safe on MPS + CUDA
+                baseline_gb = _gpu_allocated_gb(torch, device_type)
+                if device_type == "cuda":
+                    torch.cuda.reset_peak_memory_stats()
+                if progress is not None:
+                    progress(0.0, desc="Encoding inputs…")
+                try:
+                    out = pipe(
+                        image=imgs,
+                        prompt=prompt,
+                        negative_prompt=negative_prompt,
+                        true_cfg_scale=true_cfg,
+                        num_inference_steps=steps,
+                        height=h,
+                        width=w,
+                        generator=gen,
+                        callback_on_step_end=_step_callback(progress, steps),
+                    )
+                    break
+                except RuntimeError as e:
+                    if not _is_gpu_oom(e):
+                        raise
+                    last_err = e
+                    del gen
+                    gc.collect()
+                    _gpu_synchronize(torch, device_type)
+                    _gpu_empty_cache(torch, device_type)
+                    # Self-correct AFTER cleanup: at the OOM instant the heap is at its sticky
+                    # peak, so the budget would read ~0 -> no-op penalty. A clean heap returns the
+                    # real budget the config overflowed, so the next request degrades preemptively.
+                    memory.penalize(
+                        device_type, h, w, n_ref, true_cfg > 1.0,
+                        memory.activation_budget_gb(device_type), lora_active,
+                    )
+                    nxt = memory.step_down(w, h, n_ref, speed, true_cfg, steps, base_w, base_h, mode)
+                    if nxt is None:
+                        raise RuntimeError(f"GPU OOM at the smallest config and cannot degrade further: {e}") from e
+                    w, h, n_ref = nxt["width"], nxt["height"], nxt["n_ref"]
+                    speed, true_cfg, steps = nxt["speed"], nxt["true_cfg"], nxt["steps"]
+                    # A degrade to Fast drops the (Quality-only) user LoRA: the next attempt's
+                    # _apply_speed switches to Lightning and the guard below skips set_adapters.
+                    # Recompute so record_peak/meta key the Fast peak correctly (NOT the LoRA slot).
+                    lora_active = bool(lora_path) and speed == "Quality"
+                    degrades.append(f"OOM-retry->{w}x{h} {speed} {n_ref + 1}img")
+            if out is None:  # pragma: no cover - defensive
+                raise RuntimeError(f"GPU inference failed after retries: {last_err}")
 
-        peak_gb = _gpu_peak_gb(torch, device_type, baseline_gb)
-        memory.record_peak(device_type, mode, h, w, n_ref, true_cfg > 1.0, peak_gb)
+            peak_gb = _gpu_peak_gb(torch, device_type, baseline_gb)
+            memory.record_peak(device_type, mode, h, w, n_ref, true_cfg > 1.0, peak_gb, lora_active)
 
-        meta = {
-            "mode": mode, "speed": speed, "steps": steps, "true_cfg": true_cfg,
-            "seed": seed, "width": w, "height": h, "num_inputs": n_ref + 1,
-            "preflight": plan["note"], "budget_gb": plan["budget_gb"],
-            "need_gb": plan["need_gb"], "measured_peak_gb": round(peak_gb, 1),
-        }
-        if degrades:
-            meta["degrades"] = degrades
-
-        gc.collect()
-        _gpu_empty_cache(torch, device_type)
-        return out.images[0], meta
+            meta = {
+                "mode": mode, "speed": speed, "steps": steps, "true_cfg": true_cfg,
+                "seed": seed, "width": w, "height": h, "num_inputs": n_ref + 1,
+                "preflight": plan["note"], "budget_gb": plan["budget_gb"],
+                "need_gb": plan["need_gb"], "measured_peak_gb": round(peak_gb, 1),
+            }
+            if degrades:
+                meta["degrades"] = degrades
+            if lora_active and speed == "Quality":
+                meta["lora"] = {"weight": lora_weight, "file": lora_path.rsplit("/", 1)[-1]}
+            return out.images[0], meta
+        finally:
+            # Cleanup runs even on error — MANDATORY on MPS (long-lived process, no re-fork):
+            # a lingering "user" adapter would leak into the next request. Keyed off
+            # user_lora_loaded (not lora_active) so an OOM degrade-to-Fast still cleans up.
+            if user_lora_loaded:
+                _delete_user_lora(pipe)
+            gc.collect()
+            _gpu_empty_cache(torch, device_type)
 
 
 def call_edit(pipe: Any, params: dict[str, Any], progress: Any = None) -> tuple[Image.Image, dict[str, Any]]:

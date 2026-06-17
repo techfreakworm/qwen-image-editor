@@ -24,6 +24,37 @@ _CFG_MIN = 0.5
 _CFG_MAX = 12.0
 _CFG_DEFAULT = 1.0  # Fast mode default; app.py swaps to 4.0 on Quality.
 
+_LORA_PLACEHOLDER = "e.g. fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA"
+
+
+def _lora_controls() -> dict[str, gr.components.Component]:
+    """Custom-LoRA controls (repo id + upload + weight), shared by both tabs.
+
+    Custom LoRAs apply in **Quality** mode only — in Fast mode the Lightning 4-step
+    distillation fights a content LoRA, so it's intentionally ignored there.
+    """
+    with gr.Accordion("Custom LoRA (Quality mode)", open=False):
+        gr.Markdown(
+            "Apply a custom LoRA on top of the base model. **Quality mode only** — ignored in Fast. "
+            "Leave blank for the default model.",
+        )
+        lora_repo = gr.Textbox(
+            label="LoRA — Hugging Face repo id",
+            placeholder=_LORA_PLACEHOLDER,
+            lines=1,
+        )
+        lora_file = gr.File(
+            label="…or upload a LoRA (.safetensors only)",
+            file_types=[".safetensors"],
+            file_count="single",
+        )
+        lora_weight = gr.Slider(
+            0.0, 1.5, value=0.9, step=0.05,
+            label="LoRA weight",
+            info="Strength of the custom LoRA (0 = off, 1.0 = full).",
+        )
+    return dict(lora_repo=lora_repo, lora_file=lora_file, lora_weight=lora_weight)
+
 
 def build_edit_tab() -> dict[str, gr.components.Component]:
     """Build the Edit tab layout.
@@ -86,6 +117,8 @@ def build_edit_tab() -> dict[str, gr.components.Component]:
                     info=TOOLTIPS["seed"],
                 )
 
+            lora = _lora_controls()
+
             generate_btn = gr.Button("Generate", variant="primary")
 
         with gr.Column(scale=5):
@@ -110,6 +143,7 @@ def build_edit_tab() -> dict[str, gr.components.Component]:
         generate_btn=generate_btn,
         output_image=output_image,
         output_meta=output_meta,
+        **lora,
     )
 
 
@@ -187,6 +221,8 @@ def build_compose_tab() -> dict[str, gr.components.Component]:
                     info=TOOLTIPS["seed"],
                 )
 
+            lora = _lora_controls()
+
             generate_btn = gr.Button("Generate", variant="primary")
 
         with gr.Column(scale=5):
@@ -213,4 +249,5 @@ def build_compose_tab() -> dict[str, gr.components.Component]:
         generate_btn=generate_btn,
         output_image=output_image,
         output_meta=output_meta,
+        **lora,
     )
